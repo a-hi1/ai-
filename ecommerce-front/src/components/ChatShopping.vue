@@ -1,6 +1,18 @@
 <template>
   <section class="shopping-shell">
-    <header class="hero-panel">
+    <div class="hero-toggle-bar">
+      <div class="hero-toggle-left">
+        <span class="hero-mini-brand">AI 导购</span>
+        <span class="connection-state" :class="backendReachable ? 'online' : 'offline'">{{ backendReachable ? '后端在线' : '本地兜底' }}</span>
+        <span class="secondary-badge">{{ latestBudgetSummary }}</span>
+      </div>
+      <div class="hero-toggle-right">
+        <span class="hero-stat-mini"><b>{{ assistantMessageCount }}</b> 轮对话</span>
+        <span class="hero-stat-mini accent"><b>{{ itemCount }}</b> 件购物车</span>
+        <button class="hero-collapse-btn" @click="heroExpanded = !heroExpanded">{{ heroExpanded ? '收起' : '配置 & 快捷提问' }}</button>
+      </div>
+    </div>
+    <header class="hero-panel" v-show="heroExpanded">
       <div class="hero-copy">
         <p class="eyebrow">Guide</p>
         <h1>AI 导购</h1>
@@ -87,8 +99,7 @@
 
     <div v-if="notice" :class="['notice', noticeType]">{{ notice }}</div>
 
-    <div class="shopping-grid">
-      <div class="chat-panel" ref="chatPanelRef">
+    <div class="chat-panel" ref="chatPanelRef">
         <div class="chat-header">
           <div>
             <h2>导购对话工作台</h2>
@@ -96,10 +107,15 @@
           </div>
           <div class="chat-header-side">
             <div class="status-stack">
-              <span class="connection-state" :class="backendReachable ? 'online' : 'offline'">
-                {{ backendReachable ? '后端在线' : '本地兜底' }}
-              </span>
-              <span class="secondary-badge">{{ latestBudgetSummary }}</span>
+              <div class="mode-toggle">
+                <button :class="['mode-btn', answerMode === 'brief' ? 'active' : '']" @click="answerMode = 'brief'">简略</button>
+                <button :class="['mode-btn', answerMode === 'detailed' ? 'active' : '']" @click="answerMode = 'detailed'">详细</button>
+              </div>
+              <button :class="['guided-switch-btn', guidedModeEnabled ? 'active' : '']" @click="guidedModeEnabled = !guidedModeEnabled">
+                {{ guidedModeEnabled ? '实时导购: 已开启' : '实时导购: 已关闭' }}
+              </button>
+              <span v-if="guidedActive" class="secondary-badge">需求采集中 · 第 {{ guidedStep + 1 }} 步</span>
+              <span class="connection-state" :class="backendReachable ? 'online' : 'offline'">{{ backendReachable ? '后端在线' : '本地兜底' }}</span>
             </div>
             <div class="session-actions">
               <button class="secondary-btn slim-btn" @click="startNewConversation">新增对话</button>
@@ -162,26 +178,29 @@
                 <span class="timestamp">{{ formatTime(msg.timestamp) }}</span>
               </div>
 
-              <div v-if="msg.role === 'assistant'" class="text assistant-text">
-                <div v-for="(block, blockIndex) in formatAssistantBlocks(msg.content)" :key="`${msg.timestamp}-${blockIndex}`" :class="['text-block', block.tone]">
+              <div v-if="msg.role === 'assistant' && answerMode === 'detailed'" class="text assistant-text">
+                <div v-for="(block, blockIndex) in formatAssistantBlocks(compactAssistantDetail(msg.content))" :key="`${msg.timestamp}-${blockIndex}`" :class="['text-block', block.tone]">
                   <span class="text-emoji">{{ block.emoji }}</span>
                   <span class="text-line" v-html="block.html"></span>
                 </div>
               </div>
-              <div v-else class="text">{{ msg.content }}</div>
+              <div v-if="msg.role === 'assistant' && answerMode === 'brief'" class="brief-summary-row">
+                <span class="brief-one-line">{{ briefAssistantSentence(msg) }}</span>
+              </div>
+              <div v-if="msg.role === 'user'" class="text">{{ msg.content }}</div>
 
-              <div v-if="msg.role === 'assistant' && (msg.detectedIntent || msg.budgetSummary)" class="message-summary">
+              <div v-if="msg.role === 'assistant' && answerMode === 'detailed' && (msg.detectedIntent || msg.budgetSummary)" class="message-summary">
                 <span v-if="msg.detectedIntent" class="summary-pill">{{ msg.detectedIntent }}</span>
                 <span v-if="msg.budgetSummary" class="summary-pill">{{ msg.budgetSummary }}</span>
                 <span v-if="msg.fallback" class="summary-pill warning">已切换兜底建议</span>
               </div>
 
-              <div v-if="msg.role === 'assistant' && msg.fallback && fallbackReasonText(msg)" class="fallback-reason-banner">
+              <div v-if="msg.role === 'assistant' && answerMode === 'detailed' && msg.fallback && fallbackReasonText(msg)" class="fallback-reason-banner">
                 <strong>兜底原因</strong>
                 <span>{{ fallbackReasonText(msg) }}</span>
               </div>
 
-              <div v-if="msg.insights?.length || msg.goodsList?.length" class="advisor-brief">
+              <div v-if="answerMode === 'detailed' && (msg.insights?.length || msg.goodsList?.length)" class="advisor-brief">
                 <div v-if="firstRecommendedGoods(msg)" class="brief-card spotlight">
                   <span>本轮主推</span>
                   <strong>{{ firstRecommendedGoods(msg)?.name }}</strong>
@@ -193,7 +212,7 @@
                 </div>
               </div>
 
-              <div v-if="msg.role === 'assistant' && toolTraceSteps(msg).length" class="tool-trace-panel">
+              <div v-if="msg.role === 'assistant' && answerMode === 'detailed' && toolTraceSteps(msg).length" class="tool-trace-panel">
                 <strong>分析过程</strong>
                 <div class="tool-trace-list">
                   <span v-for="(trace, traceIndex) in toolTraceSteps(msg)" :key="`${msg.timestamp}-trace-${traceIndex}`" class="trace-pill">
@@ -288,13 +307,18 @@
             {{ sending ? '分析中...' : '发送需求' }}
           </button>
         </div>
-      </div>
+    </div>
 
-      <aside class="sidebar-panel">
-        <section class="cart-panel">
-          <div class="cart-header">
-            <span>购物车（{{ itemCount }}）</span>
-            <button class="clear-cart" @click="clearCart">清空</button>
+    <!-- Floating Cart Bubble -->
+    <div class="cart-bubble-wrapper">
+      <transition name="cart-slide">
+        <div class="cart-drawer" v-if="cartOpen">
+          <div class="cart-drawer-header">
+            <span class="cart-drawer-title">购物车（{{ itemCount }}）</span>
+            <div class="cart-drawer-actions">
+              <button class="clear-cart" @click="clearCart">清空</button>
+              <button class="cart-drawer-close" @click="cartOpen = false">×</button>
+            </div>
           </div>
           <div v-if="cartErrorMessage" class="cart-error">{{ cartErrorMessage }}</div>
           <div class="cart-list">
@@ -315,12 +339,17 @@
               </div>
             </div>
           </div>
-          <div v-if="cartItems.length" class="cart-footer">
+          <div v-if="cartItems.length" class="cart-drawer-footer">
             <div class="total-price">合计：{{ cartTotalLabel }}</div>
             <button class="pay-btn" @click="toPay">前往结算</button>
           </div>
-        </section>
-      </aside>
+        </div>
+      </transition>
+      <button class="cart-bubble-btn" @click="cartOpen = !cartOpen" :class="{ open: cartOpen }">
+        <span class="bubble-icon">🛒</span>
+        <span v-if="itemCount > 0" class="bubble-badge">{{ itemCount }}</span>
+        <span class="bubble-label">{{ cartOpen ? '收起' : (itemCount > 0 ? cartTotalLabel : '购物车') }}</span>
+      </button>
     </div>
   </section>
 </template>
@@ -384,6 +413,17 @@ interface SpeechRecognitionConstructor {
   new (): SpeechRecognitionLike
 }
 
+type GuidedRequirementProfile = {
+  category: string
+  budget: number | null
+  usage: string
+  brand: string
+  camera: string
+  battery: string
+  performance: string
+  storage: string
+}
+
 const inputValue = ref('')
 const messageList = ref<Message[]>([])
 const chatRef = ref<HTMLDivElement | null>(null)
@@ -409,7 +449,36 @@ const providerForm = ref({
 const analysisStepIndex = ref(0)
 const analysisElapsedSeconds = ref(0)
 const analysisVisible = ref(false)
+const cartOpen = ref(false)
+const answerMode = ref<'brief' | 'detailed'>('detailed')
+const heroExpanded = ref(false)
+const guidedModeEnabled = ref(true)
+const guidedActive = ref(false)
+const guidedStep = ref(0)
+const guidedQuestionCount = ref(0)
+const guidedSkippedKeys = ref<Array<keyof GuidedRequirementProfile>>([])
+const guidedProfile = ref<GuidedRequirementProfile>({
+  category: '',
+  budget: null,
+  usage: '',
+  brand: '',
+  camera: '',
+  battery: '',
+  performance: '',
+  storage: ''
+})
 
+const PHONE_GUIDED_STEPS: Array<{ key: keyof GuidedRequirementProfile, question: string, required?: boolean }> = [
+  { key: 'budget', question: '先确认预算：你预计手机预算是多少？例如 2500 / 3500 / 5000+。', required: true },
+  { key: 'usage', question: '主要使用场景是？例如日常流畅、拍照、游戏、商务、长辈使用。', required: true },
+  { key: 'brand', question: '有品牌偏好吗？例如华为/小米/OPPO/vivo/苹果，还是都可以？', required: true },
+  { key: 'camera', question: '拍照需求到什么程度？重视人像、夜景、视频防抖，还是一般记录即可？' },
+  { key: 'battery', question: '续航和快充有要求吗？比如重度一天一充、至少 5000mAh、快充 80W+。' },
+  { key: 'performance', question: '性能优先级如何？偏重大型游戏，还是只要日常顺滑即可？' },
+  { key: 'storage', question: '存储容量希望多大？128G / 256G / 512G。', required: true }
+]
+
+const FUZZY_UNKNOWN_WORDS = ['都可以', '都行', '无所谓', '随便', '不太清楚', '不清楚', '不确定', '你决定', '没要求']
 const analysisProgressSteps = [
   '识别需求与预算',
   '检索商品候选',
@@ -500,6 +569,197 @@ const formatTime = (timestamp?: string) => {
     return '--:--'
   }
   return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+}
+
+const parseBudgetFromText = (text: string) => {
+  const matches = [...text.matchAll(/(\d{2,6})(?:\s*)(?:元|块|rmb|人民币|预算)?/gi)]
+  if (!matches.length) {
+    return null
+  }
+
+  const values = matches.map(item => Number(item[1] || 0)).filter(value => value > 0)
+  if (!values.length) {
+    return null
+  }
+
+  return Math.max(...values)
+}
+
+const includesAny = (text: string, keywords: string[]) => keywords.some(keyword => text.includes(keyword))
+const isFuzzyUnknownAnswer = (text: string) => includesAny(text.toLowerCase(), FUZZY_UNKNOWN_WORDS)
+const wantsDirectRecommendation = (text: string) => includesAny(text.toLowerCase(), ['直接推荐', '直接给推荐', '你直接推荐', '你帮我定', '不用问了', '先推荐'])
+
+const markGuidedStepSkipped = (key: keyof GuidedRequirementProfile) => {
+  if (!guidedSkippedKeys.value.includes(key)) {
+    guidedSkippedKeys.value.push(key)
+  }
+}
+
+const updateGuidedProfileFromMessage = (rawMessage: string) => {
+  const text = rawMessage.toLowerCase()
+  const profile = guidedProfile.value
+
+  if (!profile.category && includesAny(text, ['手机', 'phone', 'smartphone', '苹果', '安卓'])) {
+    profile.category = '手机'
+  }
+
+  const budget = parseBudgetFromText(text)
+  if (budget !== null) {
+    profile.budget = budget
+  }
+
+  if (!profile.usage && includesAny(text, ['拍照', '摄影', '游戏', '办公', '通勤', '商务', '老人', '长辈', '日常'])) {
+    profile.usage = rawMessage.trim()
+  }
+
+  if (!profile.brand && includesAny(text, ['华为', '荣耀', '小米', '红米', 'oppo', 'vivo', '苹果', 'iphone', '三星', '都可以', '无所谓'])) {
+    profile.brand = rawMessage.trim()
+  }
+
+  if (!profile.camera && includesAny(text, ['拍照', '夜景', '人像', '视频', '防抖', '镜头'])) {
+    profile.camera = rawMessage.trim()
+  }
+
+  if (!profile.battery && includesAny(text, ['续航', '电池', '快充', '充电', '一天一充', '5000'])) {
+    profile.battery = rawMessage.trim()
+  }
+
+  if (!profile.performance && includesAny(text, ['游戏', '性能', '流畅', '发热', '处理器', '芯片'])) {
+    profile.performance = rawMessage.trim()
+  }
+
+  if (!profile.storage && includesAny(text, ['128', '256', '512', '1tb', '存储', '内存'])) {
+    profile.storage = rawMessage.trim()
+  }
+}
+
+const isGuidedStepDone = (key: keyof GuidedRequirementProfile) => {
+  if (guidedSkippedKeys.value.includes(key)) {
+    return true
+  }
+
+  const value = guidedProfile.value[key]
+  if (typeof value === 'number') {
+    return Number.isFinite(value)
+  }
+  return Boolean((value || '').toString().trim())
+}
+
+const getGuidedCompletionScore = () => {
+  const profile = guidedProfile.value
+  const coreFilled = [
+    profile.budget !== null || guidedSkippedKeys.value.includes('budget'),
+    Boolean(profile.usage) || guidedSkippedKeys.value.includes('usage'),
+    Boolean(profile.brand) || guidedSkippedKeys.value.includes('brand'),
+    Boolean(profile.storage) || guidedSkippedKeys.value.includes('storage')
+  ].filter(Boolean).length
+
+  const extraFilled = [
+    Boolean(profile.camera) || guidedSkippedKeys.value.includes('camera'),
+    Boolean(profile.battery) || guidedSkippedKeys.value.includes('battery'),
+    Boolean(profile.performance) || guidedSkippedKeys.value.includes('performance')
+  ].filter(Boolean).length
+
+  return { coreFilled, extraFilled }
+}
+
+const shouldFinalizeGuidedFlow = (latestMessage: string) => {
+  const { coreFilled, extraFilled } = getGuidedCompletionScore()
+
+  if (coreFilled >= 3) {
+    return true
+  }
+
+  if (coreFilled >= 2 && guidedQuestionCount.value >= 2) {
+    return true
+  }
+
+  if (guidedQuestionCount.value >= 4) {
+    return true
+  }
+
+  if (wantsDirectRecommendation(latestMessage) && coreFilled >= 1) {
+    return true
+  }
+
+  return extraFilled >= 2 && coreFilled >= 1
+}
+
+const getNextGuidedStep = (): ({ key: keyof GuidedRequirementProfile, question: string, index: number }) | null => {
+  for (const [index, step] of PHONE_GUIDED_STEPS.entries()) {
+    if (!isGuidedStepDone(step.key)) {
+      return { key: step.key, question: step.question, index }
+    }
+  }
+  return null
+}
+
+const shouldEnterPhoneGuidedFlow = (message: string) => {
+  if (!guidedModeEnabled.value) {
+    return false
+  }
+  const normalized = message.toLowerCase()
+  return includesAny(normalized, ['手机', 'phone', 'smartphone', 'iphone', '安卓'])
+}
+
+const buildGuidedPrompt = (userMessage: string) => {
+  const profile = guidedProfile.value
+  const budgetText = profile.budget ? `${profile.budget} 元` : (guidedSkippedKeys.value.includes('budget') ? '预算不设限' : '未明确')
+  const asLabel = (key: keyof GuidedRequirementProfile, value: string) => value || (guidedSkippedKeys.value.includes(key) ? '不限定' : '未明确')
+
+  return [
+    '你是资深手机导购专家，请基于以下信息给出最合理推荐。',
+    '如果用户条件不完整，请按常见主流偏好补齐合理默认值，并说明你如何取舍。',
+    `用户原始需求：${userMessage}`,
+    `品类：${profile.category || '手机'}`,
+    `预算：${budgetText}`,
+    `使用场景：${asLabel('usage', profile.usage)}`,
+    `品牌偏好：${asLabel('brand', profile.brand)}`,
+    `拍照要求：${asLabel('camera', profile.camera)}`,
+    `续航/快充：${asLabel('battery', profile.battery)}`,
+    `性能要求：${asLabel('performance', profile.performance)}`,
+    `存储要求：${asLabel('storage', profile.storage)}`,
+    '请输出 3 款主推和 2 款备选，且优先满足预算和关键刚需。'
+  ].join('\n')
+}
+
+const pushAssistantQuestion = (question: string) => {
+  messageList.value.push({
+    role: 'assistant',
+    content: question,
+    timestamp: new Date().toISOString(),
+    detectedIntent: '手机导购需求采集中',
+    budgetSummary: guidedProfile.value.budget ? `预算约 ${formatCurrency(guidedProfile.value.budget)}` : '预算待确认'
+  })
+  persistCurrentSession()
+}
+
+const compactAssistantDetail = (content: string) => {
+  const text = (content || '').replace(/\s+/g, ' ').trim()
+  if (!text) {
+    return '已为你整理好推荐结果，请直接查看下方商品卡片。'
+  }
+
+  if (text.length <= 220) {
+    return text
+  }
+
+  return `${text.slice(0, 220).trim()}...`
+}
+
+const briefAssistantSentence = (msg: Message) => {
+  const count = msg.goodsList?.length ?? 0
+  const intent = msg.detectedIntent?.trim()
+
+  if (count > 0 && intent) {
+    return `已按「${intent}」为你筛选 ${count} 款商品，直接看下方卡片即可。`
+  }
+
+  if (count > 0) {
+    return `已为你筛选 ${count} 款商品，直接看下方卡片即可。`
+  }
+
+  return '已根据你的需求整理建议，请查看下方内容。'
 }
 
 const firstRecommendedGoods = (message: Message) => message.goodsList?.[0]
@@ -676,6 +936,23 @@ const persistCurrentSession = () => {
   refreshSessionList()
 }
 
+const resetGuidedFlow = () => {
+  guidedActive.value = false
+  guidedStep.value = 0
+  guidedQuestionCount.value = 0
+  guidedSkippedKeys.value = []
+  guidedProfile.value = {
+    category: '',
+    budget: null,
+    usage: '',
+    brand: '',
+    camera: '',
+    battery: '',
+    performance: '',
+    storage: ''
+  }
+}
+
 const loadSession = (sessionId: string) => {
   const session = getChatSession(advisorUserId.value, sessionId)
   if (!session) {
@@ -706,6 +983,7 @@ const ensureActiveSession = () => {
 const startNewConversation = () => {
   const session = createChatSession(advisorUserId.value)
   refreshSessionList()
+  resetGuidedFlow()
   activeSessionId.value = session.id
   messageList.value = []
   inputValue.value = ''
@@ -1022,8 +1300,45 @@ const sendMessage = async () => {
   persistCurrentSession()
   scrollToBottom()
 
+  const enteringGuidedFlow = !guidedActive.value && shouldEnterPhoneGuidedFlow(inputVal)
+  if (enteringGuidedFlow) {
+    guidedActive.value = true
+    guidedProfile.value.category = '手机'
+    guidedStep.value = 0
+  }
+
+  if (guidedActive.value) {
+    updateGuidedProfileFromMessage(inputVal)
+
+    const currentStep = PHONE_GUIDED_STEPS[guidedStep.value]
+    if (currentStep && isFuzzyUnknownAnswer(inputVal)) {
+      markGuidedStepSkipped(currentStep.key)
+      if (currentStep.key === 'brand' && !guidedProfile.value.brand) {
+        guidedProfile.value.brand = '主流品牌均可'
+      }
+      if (currentStep.key === 'usage' && !guidedProfile.value.usage) {
+        guidedProfile.value.usage = '日常综合使用'
+      }
+    }
+
+    const pendingStep = getNextGuidedStep()
+    if (pendingStep && !shouldFinalizeGuidedFlow(inputVal)) {
+      guidedStep.value = pendingStep.index
+      guidedQuestionCount.value += 1
+      pushAssistantQuestion(pendingStep.question)
+      await stopAnalysisVisualization()
+      sending.value = false
+      scrollToBottom()
+      return
+    }
+  }
+
+  const requestMessage = guidedActive.value
+    ? buildGuidedPrompt(inputVal)
+    : inputVal
+
   try {
-    const chatRes = await api.sendChat(advisorUserId.value, inputVal)
+    const chatRes = await api.sendChat(advisorUserId.value, requestMessage)
     backendReachable.value = true
     const goodsList = (chatRes.recommendations ?? []).map(mapRecommendation)
     const relatedGoods = (chatRes.relatedRecommendations ?? []).map(mapRecommendation)
@@ -1041,6 +1356,9 @@ const sendMessage = async () => {
     persistCurrentSession()
 
     await Promise.all(goodsList.slice(0, 3).map(item => recordView(item, 'chat-recommendation')))
+    if (guidedActive.value) {
+      resetGuidedFlow()
+    }
   } catch {
     const validUser = await validateActiveUser()
     if (!validUser) {
@@ -1068,6 +1386,9 @@ const sendMessage = async () => {
       fallback: true
     })
     persistCurrentSession()
+    if (guidedActive.value) {
+      resetGuidedFlow()
+    }
   } finally {
     await stopAnalysisVisualization()
     sending.value = false
@@ -1116,10 +1437,13 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 
 <style scoped>
 .shopping-shell {
-  max-width: 1460px;
+  width: 100%;
+  max-width: 100%;
+  padding: 0 20px 80px;
   margin: 0 auto;
   display: grid;
-  gap: 22px;
+  gap: 14px;
+  box-sizing: border-box;
 }
 
 .hero-panel {
@@ -1378,14 +1702,10 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 }
 
 .shopping-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1.7fr) minmax(300px, 0.82fr);
-  gap: 18px;
-  align-items: start;
+  display: block;
 }
 
-.chat-panel,
-.sidebar-panel {
+.chat-panel {
   background: rgba(255, 255, 255, 0.9);
   border: 1px solid rgba(255, 255, 255, 0.78);
   border-radius: 28px;
@@ -1393,8 +1713,7 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
   backdrop-filter: blur(14px);
 }
 
-.chat-panel,
-.sidebar-panel {
+.chat-panel {
   padding: 18px;
 }
 
@@ -1682,7 +2001,8 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 }
 
 .chat-container {
-  height: 620px;
+  height: calc(100vh - 280px);
+  min-height: 520px;
   margin-top: 16px;
   padding: 8px 6px 8px 0;
   overflow-y: auto;
@@ -2146,10 +2466,7 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 }
 
 .sidebar-panel {
-  display: grid;
-  gap: 16px;
-  position: sticky;
-  top: 104px;
+  display: none;
 }
 
 .summary-panel,
@@ -2352,8 +2669,7 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 }
 
 @media (max-width: 1180px) {
-  .hero-panel,
-  .shopping-grid {
+  .hero-panel {
     grid-template-columns: 1fr;
   }
 
@@ -2468,5 +2784,290 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
   .hero-stat strong {
     font-size: 13px;
   }
+}
+
+/* ── Hero toggle bar ─────────────────────────────────── */
+.hero-toggle-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 16px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.88);
+  border: 1px solid rgba(255, 255, 255, 0.78);
+  box-shadow: var(--shadow-soft);
+  backdrop-filter: blur(10px);
+  flex-wrap: wrap;
+}
+
+.hero-toggle-left,
+.hero-toggle-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.hero-mini-brand {
+  font-weight: 800;
+  font-size: 15px;
+  color: var(--brand-deep, #1f6f5c);
+}
+
+.hero-stat-mini {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: #f4efe7;
+  color: #5c554d;
+  font-size: 12px;
+}
+
+.hero-stat-mini.accent {
+  background: #dff5ea;
+  color: #0d6b51;
+}
+
+.hero-collapse-btn {
+  padding: 7px 14px;
+  border-radius: 999px;
+  border: 1px solid #d4c9b9;
+  background: #fff;
+  color: #4a5568;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.hero-collapse-btn:hover {
+  background: #f0ebe3;
+}
+
+/* ── Mode toggle (简略 / 详细) ───────────────────────── */
+.mode-toggle {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  background: #f0ebe3;
+  padding: 3px;
+  gap: 2px;
+}
+
+.mode-btn {
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: none;
+  background: transparent;
+  color: #6a625a;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 160ms, color 160ms;
+}
+
+.mode-btn.active {
+  background: #1f6f5c;
+  color: #fff;
+}
+
+.guided-switch-btn {
+  border: none;
+  border-radius: 999px;
+  padding: 7px 12px;
+  font-size: 12px;
+  font-weight: 700;
+  background: #f4efe7;
+  color: #5c554d;
+  cursor: pointer;
+}
+
+.guided-switch-btn.active {
+  background: #dff5ea;
+  color: #0d6b51;
+}
+
+/* ── Brief mode summary row ──────────────────────────── */
+.brief-summary-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 4px 0 8px;
+}
+
+.brief-one-line {
+  display: inline-flex;
+  align-items: center;
+  padding: 8px 12px;
+  border-radius: 12px;
+  background: #f4efe7;
+  color: #4e463e;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.brief-intent-tag,
+.brief-count-tag,
+.brief-budget-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.brief-intent-tag {
+  background: #edf4f6;
+  color: #1d4355;
+}
+
+.brief-count-tag {
+  background: #dff5ea;
+  color: #0d6b51;
+}
+
+.brief-budget-tag {
+  background: #fff3e6;
+  color: #a25515;
+}
+
+/* ── Floating cart bubble ────────────────────────────── */
+.cart-bubble-wrapper {
+  position: fixed;
+  bottom: 28px;
+  right: 28px;
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.cart-bubble-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 20px;
+  border-radius: 999px;
+  border: none;
+  background: linear-gradient(135deg, #1f6f5c 0%, #169a7f 100%);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 6px 24px rgba(31, 111, 92, 0.38);
+  transition: transform 160ms, box-shadow 160ms;
+}
+
+.cart-bubble-btn:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 10px 30px rgba(31, 111, 92, 0.45);
+}
+
+.cart-bubble-btn.open {
+  background: linear-gradient(135deg, #243340 0%, #3a5068 100%);
+}
+
+.bubble-icon {
+  font-size: 18px;
+  line-height: 1;
+}
+
+.bubble-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #f97316;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 800;
+  padding: 0 4px;
+}
+
+.bubble-label {
+  font-size: 13px;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Cart drawer (floating panel) */
+.cart-drawer {
+  width: 320px;
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+  background: rgba(255, 255, 255, 0.97);
+  border: 1px solid rgba(255, 255, 255, 0.8);
+  border-radius: 22px;
+  box-shadow: 0 20px 48px rgba(31, 41, 55, 0.18);
+  overflow: hidden;
+  backdrop-filter: blur(14px);
+}
+
+.cart-drawer-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 14px 16px 12px;
+  border-bottom: 1px solid #ece3d6;
+  flex-shrink: 0;
+}
+
+.cart-drawer-title {
+  font-weight: 700;
+  font-size: 15px;
+  color: #243340;
+}
+
+.cart-drawer-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.cart-drawer-close {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: none;
+  background: #f3f0ea;
+  color: #6a625a;
+  font-size: 16px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.cart-drawer .cart-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 16px;
+}
+
+.cart-drawer-footer {
+  padding: 12px 16px 14px;
+  border-top: 1px solid #ece3d6;
+  flex-shrink: 0;
+}
+
+/* Cart slide transition */
+.cart-slide-enter-active,
+.cart-slide-leave-active {
+  transition: opacity 200ms ease, transform 200ms ease;
+}
+
+.cart-slide-enter-from,
+.cart-slide-leave-to {
+  opacity: 0;
+  transform: translateY(16px) scale(0.96);
 }
 </style>
