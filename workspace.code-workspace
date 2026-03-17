@@ -1,0 +1,110 @@
+{
+  "folders": [
+    {
+      "path": "ecommerce-front",
+      "name": "电商业务前端"
+    },
+    {
+      "path": "monitor-front",
+      "name": "监控端前端"
+    },
+    {
+      "path": "ecommerce-backend",
+      "name": "电商后端"
+    },
+    {
+      "path": "monitor-server",
+      "name": "监控服务端"
+    },
+    {
+      "path": "data-crawler",
+      "name": "数据采集"
+    }
+  ],
+  "settings": {
+    // 全局通用设置（适配Vue3开发）
+    "editor.tabSize": 2,
+    "editor.formatOnSave": true,
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+    // Vue3专属配置（禁用Vetur，启用Volar）
+    "vetur.enable": false,
+    "volar.tsPlugin.enable": true,
+    "volar.tsPlugin.useWorkspaceDependencies": true,
+    // 隐藏冗余文件夹，简化视图
+    "files.exclude": {
+      "**/node_modules": true,
+      "**/.git": true,
+      "**/.DS_Store": true,
+      "**/dist": true
+    },
+    // ESLint配置（自动修复）
+    "editor.codeActionsOnSave": {
+      "source.fixAll.eslint": true
+    }
+  },
+  "extensions": {
+    // 工作区推荐插件（Vue3开发必备）
+    "recommendations": [
+      "vue.volar",
+      "vue.vscode-typescript-vue-plugin",
+      "esbenp.prettier-vscode",
+      "dbaeumer.vscode-eslint",
+      "trae.ai-ide",
+      "doubao.doubao-app-share-vscode-plugin"
+    ]
+  },
+  "launch": {
+    // 调试配置：一键启动各项目
+    "version": "0.2.0",
+    "configurations": [
+      {
+        "name": "启动电商前端",
+        "type": "chrome",
+        "request": "launch",
+        "url": "http://localhost:5173",
+        "webRoot": "${workspaceFolder:电商业务前端}/src",
+        "preLaunchTask": {
+          "type": "npm",
+          "script": "dev",
+          "path": "ecommerce-front/"
+        }
+      },
+      {
+        "name": "启动监控端前端",
+        "type": "chrome",
+        "request": "launch",
+        "url": "http://localhost:5174",
+        "webRoot": "${workspaceFolder:监控端前端}/src",
+        "preLaunchTask": {
+          "type": "npm",
+          "script": "dev",
+          "path": "monitor-front/"
+        }
+      },
+    ]
+  },
+  "tasks": {
+    // 定义npm脚本任务（配合调试使用）
+    "version": "2.0.0",
+    "tasks": [
+      {
+        "label": "电商前端: dev",
+        "type": "npm",
+        "script": "dev",
+        "path": "ecommerce-front/",
+        "group": "build",
+        "isBackground": true,
+        "problemMatcher": "$vite"
+      },
+      {
+        "label": "监控端前端: dev",
+        "type": "npm",
+        "script": "dev",
+        "path": "monitor-front/",
+        "group": "build",
+        "isBackground": true,
+        "problemMatcher": "$vite"
+      }
+    ]
+  }
+}

@@ -1,0 +1,49 @@
+# Python virtual environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Node.js
+node_modules/
+dist/
+.cache/
+
+# Java / Maven build artifacts
+ecommerce-backend/target/
+monitor-server/target/
+*.jar
+*.war
+*.class
+
+# Logs
+*.log
+logs/
+
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime data
+.runtime/
+
+# Excel data files (optional: remove this line if you want to track them)
+# *.xlsx
+
+# Vite / Vue build output
+ecommerce-front/dist/
+ecommerce-front/.vite/
+monitor-front/dist/
+monitor-front/.vite/

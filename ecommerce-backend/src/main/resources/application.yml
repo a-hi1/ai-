@@ -1,0 +1,84 @@
+server:
+  port: ${SERVER_PORT:8080}
+
+spring:
+  r2dbc:
+    url: ${DB_R2DBC_URL:r2dbc:postgresql://${DB_HOST:127.0.0.1}:${DB_PORT:5432}/${DB_NAME:ecommerce}}
+    username: ${DB_USER:postgres}
+    password: ${DB_PASSWORD:123456}
+  sql:
+    init:
+      mode: ${DB_INIT_MODE:never}
+      encoding: UTF-8
+      schema-locations: classpath:schema.sql
+      data-locations: classpath:sample-data.sql
+
+app:
+  demo:
+    initializer:
+      enabled: ${APP_DEMO_INITIALIZER_ENABLED:false}
+
+ai:
+  provider: ${AI_PROVIDER:deepseek}
+  runtime-config:
+    path: ${AI_RUNTIME_CONFIG_PATH:../.runtime/ecommerce-backend/ai-provider-config.json}
+  catalog:
+    refresh-interval-ms: ${AI_CATALOG_REFRESH_INTERVAL_MS:15000}
+    refresh-initial-delay-ms: ${AI_CATALOG_REFRESH_INITIAL_DELAY_MS:5000}
+  deepseek:
+    api-key: ${DEEPSEEK_API_KEY:}
+    base-url: ${DEEPSEEK_BASE_URL:https://api.deepseek.com/v1}
+    model-name: ${DEEPSEEK_MODEL_NAME:deepseek-chat}
+    timeout: ${DEEPSEEK_TIMEOUT:PT120S}
+    max-retries: ${DEEPSEEK_MAX_RETRIES:2}
+    log-requests: ${DEEPSEEK_LOG_REQUESTS:false}
+    log-responses: ${DEEPSEEK_LOG_RESPONSES:false}
+  chatgpt:
+    api-key: ${OPENAI_API_KEY:}
+    base-url: ${OPENAI_BASE_URL:https://api.openai.com/v1}
+    model-name: ${OPENAI_MODEL_NAME:gpt-4o-mini}
+    timeout: ${OPENAI_TIMEOUT:PT60S}
+    max-retries: ${OPENAI_MAX_RETRIES:1}
+    log-requests: ${OPENAI_LOG_REQUESTS:false}
+    log-responses: ${OPENAI_LOG_RESPONSES:false}
+  siliconflow:
+    api-key: ${SILICONFLOW_API_KEY:}
+    base-url: ${SILICONFLOW_BASE_URL:https://api.siliconflow.cn/v1}
+    model-name: ${SILICONFLOW_MODEL_NAME:}
+    timeout: ${SILICONFLOW_TIMEOUT:PT60S}
+    max-retries: ${SILICONFLOW_MAX_RETRIES:1}
+    log-requests: ${SILICONFLOW_LOG_REQUESTS:false}
+    log-responses: ${SILICONFLOW_LOG_RESPONSES:false}
+
+mcp:
+  endpoint: ${MCP_ENDPOINT:}
+
+vector:
+  provider: in-memory
+  endpoint: ${VECTOR_ENDPOINT:}
+
+monitor:
+  client:
+    host: ${MONITOR_HOST:localhost}
+    port: ${MONITOR_PORT:9999}
+    service-id: ${MONITOR_SERVICE_ID:}
+    service-name: ${MONITOR_SERVICE_NAME:ecommerce-backend}
+    server-type: ${MONITOR_SERVER_TYPE:product}
+    advertise-host: ${MONITOR_ADVERTISE_HOST:127.0.0.1}
+    advertise-port: ${MONITOR_ADVERTISE_PORT:8080}
+    heartbeat-interval-ms: ${MONITOR_HEARTBEAT_MS:30000}
+    control-token: ${MONITOR_CONTROL_TOKEN:monitor-dev-token}
+    restart-script: ${MONITOR_RESTART_SCRIPT:}
+    command-shutdown-delay-ms: ${MONITOR_COMMAND_SHUTDOWN_DELAY_MS:1500}
+
+payment:
+  frontend-base-url: ${PAYMENT_FRONTEND_BASE_URL:http://127.0.0.1:5174}
+  alipay:
+    mode: ${PAYMENT_ALIPAY_MODE:demo}
+    gateway: ${PAYMENT_ALIPAY_GATEWAY:https://openapi-sandbox.dl.alipaydev.com/gateway.do}
+    app-id: ${PAYMENT_ALIPAY_APP_ID:}
+    private-key: ${PAYMENT_ALIPAY_PRIVATE_KEY:}
+    public-key: ${PAYMENT_ALIPAY_PUBLIC_KEY:}
+    sign-enabled: ${PAYMENT_ALIPAY_SIGN_ENABLED:false}
+    notify-url: ${PAYMENT_ALIPAY_NOTIFY_URL:}
+    return-url: ${PAYMENT_ALIPAY_RETURN_URL:http://127.0.0.1:5174/payment/callback}
