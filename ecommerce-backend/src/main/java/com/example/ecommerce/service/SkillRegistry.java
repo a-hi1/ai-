@@ -93,9 +93,9 @@ public class SkillRegistry {
                     .collectList()
                     .map(products -> {
                         if (products.isEmpty()) {
-                            return "预算 ¥" + budget.stripTrailingZeros().toPlainString() + " 内暂时没有匹配商品。";
+                            return "预算 " + budget.stripTrailingZeros().toPlainString() + " 元内暂时没有匹配商品。";
                         }
-                        return "预算 ¥" + budget.stripTrailingZeros().toPlainString() + " 内的候选商品：\n"
+                        return "预算 " + budget.stripTrailingZeros().toPlainString() + " 元内的候选商品：\n"
                                 + products.stream().map(this::formatProductLine).reduce((left, right) -> left + "\n" + right).orElse("");
                     });
         }
@@ -118,7 +118,7 @@ public class SkillRegistry {
     }
 
     private String formatProductLine(Product product) {
-        String price = product.getPrice() == null ? "待定" : "¥" + product.getPrice().stripTrailingZeros().toPlainString();
+        String price = product.getPrice() == null ? "待定" : product.getPrice().stripTrailingZeros().toPlainString() + " 元";
         return "- " + product.getName() + " | " + price + " | " + (product.getTags() == null ? "无标签" : product.getTags());
     }
 }

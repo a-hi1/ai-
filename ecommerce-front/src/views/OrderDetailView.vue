@@ -4,7 +4,6 @@
       <div>
         <p class="eyebrow">订单详情</p>
         <h1>订单详情</h1>
-        <p v-if="order">订单 {{ order.id }} 的商品明细、支付状态和交易信息。</p>
       </div>
       <div class="hero-actions">
         <button v-if="order" class="ghost-action" type="button" :disabled="rebuying" @click="rebuyOrder">
@@ -24,7 +23,7 @@
         </div>
         <div>
           <span class="label">总金额</span>
-          <strong>¥{{ Number(order.totalAmount).toFixed(2) }}</strong>
+          <strong>{{ Number(order.totalAmount).toFixed(2) }} 元</strong>
         </div>
         <div>
           <span class="label">支付方式</span>
@@ -34,17 +33,12 @@
           <span class="label">交易号</span>
           <strong>{{ order.gatewayTradeNo || '-' }}</strong>
         </div>
-        <div v-if="order.status === 'CREATED'" class="pending-note">
-          当前订单仍待支付。你可以继续发起支付，并自由切换到支付宝沙箱或站内快速演示。
-        </div>
         <div v-if="order.status === 'CREATED'" class="pay-mode-group">
           <button class="pay-mode" :class="{ active: paymentMode === 'alipay' }" type="button" @click="paymentMode = 'alipay'">
             <strong>支付宝沙箱</strong>
-            <span>打开沙箱收银台，验证扫码支付和回跳。</span>
           </button>
           <button class="pay-mode" :class="{ active: paymentMode === 'demo' }" type="button" @click="paymentMode = 'demo'">
             <strong>站内快速演示</strong>
-            <span>直接回调成功状态，适合联调订单同步。</span>
           </button>
         </div>
         <div v-if="order.status === 'CREATED'" class="summary-actions">
@@ -59,15 +53,23 @@
 
       <section class="panel items">
         <h2>商品清单</h2>
-        <article v-for="item in order.items" :key="item.id" class="item-row">
+        <article
+          v-for="item in order.items"
+          :key="item.id"
+          class="item-row clickable"
+          role="button"
+          tabindex="0"
+          @click="openOrderItem(item)"
+          @keyup.enter="openOrderItem(item)"
+          @keyup.space.prevent="openOrderItem(item)"
+        >
           <img :src="item.imageUrl || fallbackImage(item.productId)" :alt="item.productName" loading="lazy" decoding="async" />
           <div>
             <strong>{{ item.productName }}</strong>
-            <p>{{ item.productDescription }}</p>
           </div>
           <div class="price-col">
             <span>x{{ item.quantity }}</span>
-            <strong>¥{{ Number(item.lineTotal).toFixed(2) }}</strong>
+            <strong>{{ Number(item.lineTotal).toFixed(2) }} 元</strong>
           </div>
         </article>
       </section>
@@ -81,7 +83,7 @@ import { RouterLink, useRoute, useRouter } from 'vue-router'
 
 import { useAuth } from '../composables/useAuth'
 import { useCart } from '../composables/useCart'
-import { api, type OrderDetailDto } from '../services/api'
+import { api, type OrderDetailDto, type OrderItemDto } from '../services/api'
 
 const route = useRoute()
 const router = useRouter()
@@ -97,6 +99,26 @@ const paymentMode = ref<'demo' | 'alipay'>('alipay')
 let pollTimer: number | undefined
 
 const fallbackImage = (seed: string) => `https://picsum.photos/80/80?random=${seed}`
+
+const cacheOrderItemPreview = (item: OrderItemDto) => {
+  try {
+    window.sessionStorage.setItem(`product-preview:${item.productId}`, JSON.stringify({
+      id: item.productId,
+      name: item.productName,
+      description: '',
+      price: Number(item.unitPrice),
+      imageUrl: item.imageUrl || fallbackImage(item.productId),
+      tags: ''
+    }))
+  } catch {
+    // ignore session storage failures
+  }
+}
+
+const openOrderItem = (item: OrderItemDto) => {
+  cacheOrderItemPreview(item)
+  router.push(`/products/${item.productId}`)
+}
 
 const formatStatus = (value: string) => {
   if (value === 'PAID') return '已支付'
@@ -252,8 +274,9 @@ h1 { margin: 0 0 8px; }
 .items { display: grid; gap: 12px; }
 .items h2 { margin: 0 0 6px; }
 .item-row { display: grid; grid-template-columns: 80px 1fr auto; gap: 14px; align-items: center; padding: 14px; border-radius: 16px; background: #fff8ef; }
+.item-row.clickable { cursor: pointer; transition: transform 180ms ease, box-shadow 180ms ease, border-color 180ms ease; }
+.item-row.clickable:hover, .item-row.clickable:focus-visible { transform: translateY(-2px); border-color: #dbc7ad; box-shadow: 0 12px 22px rgba(73, 52, 24, 0.08); outline: none; }
 .item-row img { width: 80px; height: 80px; border-radius: 14px; object-fit: cover; }
-.item-row p { margin: 6px 0 0; color: #665f57; }
 .price-col { display: grid; justify-items: end; gap: 6px; }
 @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } .detail-hero, .hero-actions, .summary-actions { flex-direction: column; align-items: flex-start; } }
 </style>

@@ -19,7 +19,7 @@
         <article class="shop-stat-card emphasis">
           <span>在售单品</span>
           <strong>{{ displayProductCount }}</strong>
-          <small>{{ hasActiveFilter ? '当前筛选结果' : '全站精选货架' }}</small>
+          <small>{{ hasActiveFilter ? '当前筛选结果' : '全站商品货架' }}</small>
         </article>
         <article class="shop-stat-card">
           <span>场景分区</span>
@@ -86,7 +86,7 @@
 
       <div v-if="filteredProducts.length" class="result-grid">
         <article
-          v-for="product in filteredProducts"
+          v-for="product in getSearchResultVisibleProducts()"
           :key="product.id"
           class="product-card clickable-card"
           role="link"
@@ -104,7 +104,6 @@
               <strong>{{ product.name }}</strong>
               <span>{{ formatCurrency(product.price) }}</span>
             </div>
-            <p>{{ productCardDescription(product, selectedCategory?.description || '商品详情') }}</p>
             <div v-if="splitTags(product.tags).length" class="tag-row">
               <span v-for="tag in splitTags(product.tags)" :key="tag" class="tag-pill">{{ tag }}</span>
             </div>
@@ -114,6 +113,25 @@
             <button class="cart-btn" @click.stop="addToCart(product)">加入购物车</button>
           </div>
         </article>
+      </div>
+
+      <div v-if="filteredProducts.length" class="search-pagination-section">
+        <div class="pagination-controls">
+          <label class="page-size-selector">
+            <span class="selector-label">每页显示</span>
+            <select v-model.number="searchPageSize" @change="() => { searchCurrentPage = 1; syncQuery() }">
+              <option :value="10">10条</option>
+              <option :value="20">20条</option>
+              <option :value="30">30条</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="pagination">
+          <button class="pagination-btn" :disabled="getSearchResultPage() <= 1" @click="goPreviousSearchPage">上一页</button>
+          <span class="pagination-info">第 {{ getSearchResultPage() }} / {{ Math.max(1, getSearchResultTotalPages()) }} 页</span>
+          <button class="pagination-btn" :disabled="getSearchResultPage() >= getSearchResultTotalPages()" @click="goNextSearchPage">下一页</button>
+        </div>
       </div>
 
       <div v-else class="empty-state">{{ emptyMessage }}</div>
@@ -134,7 +152,7 @@
 
         <div class="result-grid compact-grid">
           <article
-            v-for="product in group.products.slice(0, 4)"
+            v-for="product in getVisibleProducts(group.products, group.category.id)"
             :key="product.id"
             class="product-card clickable-card"
             role="link"
@@ -152,13 +170,32 @@
                 <strong>{{ product.name }}</strong>
                 <span>{{ formatCurrency(product.price) }}</span>
               </div>
-              <p>{{ productCardDescription(product, group.category.description) }}</p>
             </div>
             <div class="card-actions">
               <button class="detail-link button-link" type="button" @click.stop="openProduct(product)">查看详情</button>
               <button class="cart-btn" @click.stop="addToCart(product)">加入购物车</button>
             </div>
           </article>
+        </div>
+
+        <div v-if="getTotalPages(group.products) > 1" class="pagination">
+          <button
+            class="pagination-btn"
+            :disabled="getCategoryPage(group.category.id) === 1"
+            @click="setCategoryPage(group.category.id, getCategoryPage(group.category.id) - 1)"
+          >
+            上一页
+          </button>
+          <span class="pagination-info">
+            第 {{ getCategoryPage(group.category.id) }} / {{ getTotalPages(group.products) }} 页
+          </span>
+          <button
+            class="pagination-btn"
+            :disabled="getCategoryPage(group.category.id) >= getTotalPages(group.products)"
+            @click="setCategoryPage(group.category.id, getCategoryPage(group.category.id) + 1)"
+          >
+            下一页
+          </button>
         </div>
       </article>
     </section>
@@ -175,7 +212,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
-import { groupProductsByCategory, productCardDescription, productMatchesKeyword, SHOP_CATEGORY_CONFIG, splitProductTags } from '../catalog'
+import { groupProductsByCategory, productMatchesKeyword, splitProductTags } from '../catalog'
 import { useAuth } from '../composables/useAuth'
 import { useCart } from '../composables/useCart'
 import { api, type ProductDto } from '../services/api'
@@ -194,16 +231,66 @@ const maxPrice = ref('')
 const loadFailed = ref(false)
 const cartNotice = ref('')
 const cartNoticeTone = ref<'success' | 'error'>('success')
+const categoryPagination = ref<Record<string, number>>({})
+const searchPageSize = ref<10 | 20 | 30>(10)
+const searchCurrentPage = ref(1)
+const ITEMS_PER_PAGE = 6
 let cartNoticeTimer: number | null = null
 
 const splitTags = (tags?: string) => splitProductTags(tags).slice(0, 4)
+
+const getCategoryPage = (categoryId: string): number => {
+  return categoryPagination.value[categoryId] ?? 1
+}
+
+const setCategoryPage = (categoryId: string, page: number) => {
+  categoryPagination.value[categoryId] = Math.max(1, page)
+}
+
+const getVisibleProducts = (products: ProductDto[], categoryId: string): ProductDto[] => {
+  const currentPage = getCategoryPage(categoryId)
+  const startIdx = (currentPage - 1) * ITEMS_PER_PAGE
+  const endIdx = startIdx + ITEMS_PER_PAGE
+  return products.slice(startIdx, endIdx)
+}
+
+const getTotalPages = (products: ProductDto[]): number => {
+  return Math.ceil(products.length / ITEMS_PER_PAGE)
+}
+
+const getSearchResultPage = (): number => {
+  return searchCurrentPage.value
+}
+
+const getSearchResultTotalPages = (): number => {
+  return Math.ceil(filteredProducts.value.length / searchPageSize.value)
+}
+
+const getSearchResultVisibleProducts = (): ProductDto[] => {
+  const currentPage = getSearchResultPage()
+  const startIdx = (currentPage - 1) * searchPageSize.value
+  const endIdx = startIdx + searchPageSize.value
+  return filteredProducts.value.slice(startIdx, endIdx)
+}
+
+const setSearchPage = (page: number) => {
+  searchCurrentPage.value = Math.max(1, Math.min(page, getSearchResultTotalPages()))
+}
+
+const goPreviousSearchPage = () => {
+  setSearchPage(searchCurrentPage.value - 1)
+}
+
+const goNextSearchPage = () => {
+  setSearchPage(searchCurrentPage.value + 1)
+}
 
 const categoryGroups = computed(() => {
   return groupProductsByCategory(allProducts.value)
 })
 
 const selectedCategory = computed(() => {
-  return SHOP_CATEGORY_CONFIG.find(item => item.id === selectedCategoryId.value) ?? null
+  return categoryGroups.value.find(group => group.category.id === selectedCategoryId.value)?.category ?? null
 })
 
 const filteredProducts = computed(() => {
@@ -345,15 +432,20 @@ const syncQuery = () => {
   if (maxPrice.value) {
     nextQuery.max = maxPrice.value
   }
+  if (keyword.value.trim()) {
+    nextQuery.pageSize = String(searchPageSize.value)
+  }
   void router.replace({ path: '/shop', query: nextQuery })
 }
 
 const search = () => {
+  searchCurrentPage.value = 1
   syncQuery()
 }
 
 const applyCategory = (categoryId: string) => {
   selectedCategoryId.value = categoryId
+  searchCurrentPage.value = 1
   syncQuery()
 }
 
@@ -363,6 +455,8 @@ const resetFilter = () => {
   sortBy.value = 'default'
   minPrice.value = ''
   maxPrice.value = ''
+  searchCurrentPage.value = 1
+  searchPageSize.value = 10
   syncQuery()
 }
 
@@ -405,6 +499,12 @@ const applyRouteQuery = () => {
     : 'default'
   minPrice.value = typeof route.query.min === 'string' ? route.query.min : ''
   maxPrice.value = typeof route.query.max === 'string' ? route.query.max : ''
+  if (route.query.pageSize === '20' || route.query.pageSize === '30') {
+    searchPageSize.value = Number(route.query.pageSize) as 10 | 20 | 30
+  } else {
+    searchPageSize.value = 10
+  }
+  searchCurrentPage.value = 1
 }
 
 onMounted(async () => {
@@ -458,6 +558,95 @@ onBeforeUnmount(() => {
   background: rgba(153, 27, 27, 0.9);
   color: #fef2f2;
   box-shadow: 0 18px 40px rgba(153, 27, 27, 0.28);
+}
+
+.pagination {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 12px;
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid #e5e7eb;
+}
+
+.search-pagination-section {
+  display: grid;
+  gap: 16px;
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid #e5e7eb;
+}
+
+.pagination-controls {
+  display: flex;
+  justify-content: flex-start;
+}
+
+.page-size-selector {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  color: #374151;
+  font-weight: 500;
+}
+
+.page-size-selector select {
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid #d1d5db;
+  background: #fff;
+  color: #374151;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 140ms;
+}
+
+.page-size-selector select:hover {
+  border-color: #1f6f5c;
+}
+
+.page-size-selector select:focus {
+  outline: none;
+  border-color: #1f6f5c;
+  box-shadow: 0 0 0 3px rgba(31, 111, 92, 0.08);
+}
+
+.selector-label {
+  color: #6b7280;
+  font-weight: 400;
+}
+
+.pagination-btn {
+  padding: 8px 16px;
+  border-radius: 8px;
+  border: 1px solid #d1d5db;
+  background: #fff;
+  color: #374151;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 160ms;
+}
+
+.pagination-btn:hover:not(:disabled) {
+  background: #1f6f5c;
+  color: #fff;
+  border-color: #1f6f5c;
+}
+
+.pagination-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.pagination-info {
+  font-size: 14px;
+  color: #6b7280;
+  min-width: 120px;
+  text-align: center;
 }
 
 .cart-toast-enter-active,

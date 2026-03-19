@@ -59,6 +59,19 @@
             </select>
           </label>
         </div>
+        <div class="port-quick-add">
+          <label class="toolbar-field">
+            <span>账号标识</span>
+            <input v-model.trim="addPortAccountKey" type="text" placeholder="例如 user@example.com" />
+          </label>
+          <label class="toolbar-field">
+            <span>新增监控端口</span>
+            <input v-model.number="addPortNumber" type="number" min="1" max="65535" placeholder="例如 8082" />
+          </label>
+          <button class="primary-button" :disabled="addPortSubmitting" @click="addMonitorPort">
+            {{ addPortSubmitting ? '新增中...' : '实时新增端口' }}
+          </button>
+        </div>
       </div>
 
       <div class="header-side">
@@ -285,6 +298,7 @@ const props = withDefaults(defineProps<{ mode?: 'dashboard' | 'detail'; routeSer
 
 const apiBase = resolveMonitorApiBase()
 const wsBase = resolveMonitorWsBase(apiBase)
+const shopFrontBase = resolveShopFrontBase()
 const staleThresholdSeconds = 90
 const restartWatchMaxWaitMs = 90000
 
@@ -324,6 +338,9 @@ const dashboardWindow = ref<LiveWindow>('15m')
 const nodeWindow = ref<LiveWindow>('15m')
 const controlToken = ref('monitor-dev-token')
 const artifactUrl = ref('')
+const addPortAccountKey = ref('')
+const addPortNumber = ref(8082)
+const addPortSubmitting = ref(false)
 const commandBusy = ref(false)
 const commandAccepted = ref(false)
 const commandMessage = ref('')
@@ -719,7 +736,8 @@ const dashboardActions = {
   openService,
   setTypeFilter,
   requestCommandForService,
-  purgeOfflineService
+  purgeOfflineService,
+  openAccountWorkspace
 }
 
 const detailActions = {
@@ -728,6 +746,7 @@ const detailActions = {
   requestCommand,
   requestCommandForService,
   purgeOfflineService,
+  openAccountWorkspace,
   copyJson,
   copyText
 }
@@ -959,6 +978,57 @@ function normalizeSummary(service: ServiceSummary) {
   }
 }
 
+function extractAccountKey(service: ReturnType<typeof normalizeSummary> | ServiceSummary | null) {
+  if (!service) {
+    return ''
+  }
+  const serviceName = String(service.serviceName || '').trim()
+  const directMatch = serviceName.match(/^账号节点\s+(.+)$/)
+  if (directMatch?.[1]) {
+    return directMatch[1].trim()
+  }
+  const logText = String(service.log || '')
+  const logMatch = logText.match(/Account\s+(.+?)\s+(?:online|offline|mapped)/i)
+  if (logMatch?.[1]) {
+    return logMatch[1].trim()
+  }
+  return ''
+}
+
+function buildAccountWorkspaceUrl(service: ReturnType<typeof normalizeSummary> | ServiceSummary | null) {
+  if (!service) {
+    return ''
+  }
+  const port = Number(service.port || 0)
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    return ''
+  }
+  const url = new URL(shopFrontBase)
+  url.pathname = '/login'
+  url.searchParams.set('backendPort', String(port))
+  url.searchParams.set('monitorPort', String(port))
+  url.searchParams.set('backendHost', String(service.host || '127.0.0.1'))
+  const accountKey = extractAccountKey(service)
+  if (accountKey) {
+    url.searchParams.set('account', accountKey)
+  }
+  return url.toString()
+}
+
+function openAccountWorkspace(serviceId: string) {
+  const targetSummary = normalizedServices.value.find(service => service.id === serviceId) ?? selectedSummary.value
+  if (!targetSummary) {
+    pushToast('未找到目标账号节点', 'danger')
+    return
+  }
+  const targetUrl = buildAccountWorkspaceUrl(targetSummary)
+  if (!targetUrl) {
+    pushToast('该节点未绑定有效端口，无法打开独立页面', 'danger')
+    return
+  }
+  window.open(targetUrl, '_blank')
+}
+
 function ensureSelection() {
   if (props.mode === 'detail' && props.routeServiceId) {
     selectedServiceId.value = props.routeServiceId
@@ -1097,8 +1167,20 @@ function evaluateRestartWatch() {
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${apiBase}${path}`, init)
   if (!response.ok) {
-    const error = new Error(`HTTP ${response.status}`) as Error & { status?: number }
+    const rawBody = await response.text()
+    let reason = ''
+    if (rawBody) {
+      try {
+        const parsed = JSON.parse(rawBody) as Record<string, unknown>
+        reason = String(parsed.status || parsed.message || '').trim()
+      } catch {
+        reason = rawBody.trim()
+      }
+    }
+    const suffix = reason ? `: ${reason}` : ''
+    const error = new Error(`HTTP ${response.status}${suffix}`) as Error & { status?: number; detail?: string }
     error.status = response.status
+    error.detail = reason
     throw error
   }
   return response.json() as Promise<T>
@@ -1370,7 +1452,14 @@ async function sendCommand(action: string) {
     action,
     token: controlToken.value,
     artifactUrl: action === 'UPGRADE' ? artifactUrl.value : '',
-    args: {}
+    args: {
+      host: String(targetSummary.host || '127.0.0.1'),
+      port: String(Number(targetSummary.port || 0)),
+      serviceName: String(targetSummary.serviceName || ''),
+      serverType: String(targetSummary.serverType || 'backend'),
+      serviceId: String(targetSummary.id || ''),
+      accountKey: extractAccountKey(targetSummary)
+    }
   }
   lastCommandPayload.value = JSON.stringify(payload, null, 2)
   lastCommandResult.value = ''
@@ -1465,6 +1554,56 @@ async function purgeOfflineService(serviceId: string) {
   }
 }
 
+async function addMonitorPort() {
+  const accountKey = addPortAccountKey.value.trim()
+  if (!accountKey) {
+    pushToast('请先输入账号标识（一个账号对应一个节点）', 'danger')
+    return
+  }
+
+  const port = Number(addPortNumber.value || 0)
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    pushToast('请输入 1 到 65535 的端口号', 'danger')
+    return
+  }
+
+  addPortSubmitting.value = true
+  try {
+    const result = await fetchJson<{ accepted: boolean; status: string; serverId?: string; port?: number }>(
+      '/api/monitor/service/add-port',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Monitor-Token': controlToken.value
+        },
+        body: JSON.stringify({
+          accountKey,
+          port,
+          host: '127.0.0.1',
+          serviceName: `账号节点 ${accountKey}`,
+          serverType: 'backend',
+          token: controlToken.value
+        })
+      }
+    )
+
+    if (!result.accepted) {
+      throw new Error(`新增端口失败，状态 ${result.status || 'UNKNOWN'}`)
+    }
+
+    await loadEverything()
+    if (result.serverId) {
+      selectedServiceId.value = result.serverId
+    }
+    pushToast(`端口 ${result.port || port} 已加入监控列表`, 'success')
+  } catch (error) {
+    pushToast(error instanceof Error ? error.message : '新增端口失败', 'danger')
+  } finally {
+    addPortSubmitting.value = false
+  }
+}
+
 function exportCsv() {
   const headers = ['serverId', 'serviceName', 'serverType', 'status', 'host', 'port', 'cpuUsage', 'memoryUsage', 'diskUsage', 'networkLatency', 'networkThroughputMbps', 'threadCount', 'gcCount', 'lastHeartbeat']
   const rows = filteredServices.value.map(service => headers.map(header => csvEscape(String((service as Record<string, unknown>)[header] ?? ''))).join(','))
@@ -1496,6 +1635,14 @@ function resolveMonitorWsBase(currentApiBase: string) {
   const wsProtocol = normalizedApiBase.startsWith('https://') ? 'wss://' : 'ws://'
   const hostPart = normalizedApiBase.replace(/^https?:\/\//, '')
   return `${wsProtocol}${hostPart}/ws/monitor`
+}
+
+function resolveShopFrontBase() {
+  const fromEnv = import.meta.env.VITE_SHOP_FRONT_BASE?.trim()
+  if (fromEnv) {
+    return fromEnv.replace(/\/+$/, '')
+  }
+  return 'http://127.0.0.1:5173'
 }
 
 function loadThemeMode(): 'dark' | 'light' {
@@ -1791,6 +1938,15 @@ function formatCommandStatusMessage(action: string, status?: string, commandId?:
   }
   if (action === 'RESTART' && status === 'SENT') {
     return `已向在线节点发送重启命令，命令号 ${commandId || 'N/A'}。`
+  }
+  if (action === 'RESTART' && status === 'LOCAL_RESTART_SCRIPT_NOT_FOUND') {
+    return '重启失败：monitor-server 未找到本地重启脚本，请检查 MONITOR_LOCAL_RESTART_SCRIPT 或工作目录。'
+  }
+  if (action === 'RESTART' && String(status || '').startsWith('LOCAL_LAUNCH_FAILED')) {
+    return `重启失败：${status}`
+  }
+  if (action === 'RESTART' && status === 'INVALID_TARGET_PORT') {
+    return '重启失败：该节点没有有效端口，请先在登录页填写后端端口并完成在线同步。'
   }
   return `${formatAction(action)}已发送，命令号 ${commandId || 'N/A'}`
 }
@@ -2123,6 +2279,17 @@ onBeforeUnmount(() => {
   display: grid;
   gap: 14px;
   padding: 16px;
+}
+
+.port-quick-add {
+  display: flex;
+  gap: 10px;
+  align-items: end;
+  flex-wrap: wrap;
+}
+
+.port-quick-add .toolbar-field {
+  min-width: 180px;
 }
 
 .nav-alert-dot {

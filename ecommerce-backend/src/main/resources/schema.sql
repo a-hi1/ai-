@@ -115,10 +115,15 @@ CREATE TABLE IF NOT EXISTS order_items (
 CREATE TABLE IF NOT EXISTS chat_messages (
   id UUID PRIMARY KEY,
   user_id UUID NOT NULL,
+  session_id VARCHAR(128),
   role VARCHAR(32) NOT NULL,
   content TEXT NOT NULL,
   created_at TIMESTAMP NOT NULL
 );
+
+ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS session_id VARCHAR(128);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_user_session_created
+  ON chat_messages(user_id, session_id, created_at);
 
 CREATE TABLE IF NOT EXISTS product_views (
   id UUID PRIMARY KEY,

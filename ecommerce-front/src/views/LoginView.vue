@@ -23,6 +23,7 @@
 
       <div class="panel">
         <h2>登录</h2>
+        <p v-if="offlineHint" class="offline-hint">你已退出登录，当前状态为离线。请重新登录继续实时导购。</p>
         <p class="hint">使用演示账号即可体验中文聊天导购、搜索、下单与支付流程。</p>
         <label>
           邮箱
@@ -31,6 +32,10 @@
         <label>
           密码
           <input v-model="password" type="password" placeholder="请输入密码" />
+        </label>
+        <label>
+          监控端口
+          <input v-model.number="monitorPort" type="number" min="1" max="65535" placeholder="例如 8081" />
         </label>
         <p v-if="errorMessage" class="error">{{ errorMessage }}</p>
         <button class="primary" :disabled="submitting" @click="submit">{{ submitting ? '登录中...' : '登录' }}</button>
@@ -45,21 +50,27 @@
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuth } from '../composables/useAuth'
+import { computed } from 'vue'
+import { useRoute } from 'vue-router'
 
 const router = useRouter()
+const route = useRoute()
 const { login } = useAuth()
 
-const email = ref('')
+const email = ref(String(route.query.account || ''))
 const password = ref('')
+const requestedPort = Number(route.query.monitorPort || route.query.backendPort || 8081)
+const monitorPort = ref(Number.isInteger(requestedPort) && requestedPort > 0 && requestedPort <= 65535 ? requestedPort : 8081)
 const submitting = ref(false)
 const errorMessage = ref('')
+const offlineHint = computed(() => route.query.offline === '1')
 
 const submit = async () => {
   if (!email.value || !password.value || submitting.value) return
   submitting.value = true
   errorMessage.value = ''
   try {
-    await login(email.value, password.value)
+    await login(email.value, password.value, monitorPort.value)
     router.push('/chat')
   } catch {
     errorMessage.value = '登录失败，请检查邮箱或密码。默认演示账号：demo@aishop.local / 123456'
@@ -162,6 +173,17 @@ h2 {
 .hint.demo {
   margin-top: 0;
   color: #8a6a3b;
+}
+
+.offline-hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #8a3b1a;
+  background: #fff3e6;
+  border: 1px solid #f2c9a8;
+  padding: 8px 10px;
+  border-radius: 10px;
 }
 
 .error {

@@ -40,6 +40,21 @@ export interface ChatResponse {
   fallback: boolean
 }
 
+export interface ChatStreamProgress {
+  index: number
+  total: number
+  step: string
+}
+
+export type ChatStreamHandlers = {
+  onStart?: () => void
+  onDelta?: (chunk: string) => void
+  onProgress?: (progress: ChatStreamProgress) => void
+  onFinal?: (response: ChatResponse) => void
+  onDone?: () => void
+  onError?: (message: string) => void
+}
+
 export interface AuthUserResponse {
   id: string
   email: string
@@ -204,7 +219,46 @@ export interface AiProviderConfigActionDto {
   config: AiProviderOverviewDto
 }
 
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8080'
+const API_BASE_OVERRIDE_KEY = 'tab_api_base_override'
+const API_BASE = resolveApiBase()
+const MONITOR_API_BASE = import.meta.env.VITE_MONITOR_API_BASE || 'http://127.0.0.1:9091'
+const MONITOR_CONTROL_TOKEN = import.meta.env.VITE_MONITOR_CONTROL_TOKEN || 'monitor-dev-token'
+
+function normalizeBaseUrl(value: string) {
+  return value.replace(/\/+$/, '')
+}
+
+function resolveApiBase() {
+  const fallbackBase = normalizeBaseUrl(import.meta.env.VITE_API_BASE || 'http://localhost:8080')
+
+  try {
+    const params = new URLSearchParams(window.location.search)
+    const backendBase = params.get('backendBase')?.trim()
+    const backendHost = params.get('backendHost')?.trim() || window.location.hostname || '127.0.0.1'
+    const backendPort = Number(params.get('backendPort') || 0)
+
+    if (backendBase) {
+      const normalized = normalizeBaseUrl(backendBase)
+      window.sessionStorage.setItem(API_BASE_OVERRIDE_KEY, normalized)
+      return normalized
+    }
+
+    if (Number.isInteger(backendPort) && backendPort > 0 && backendPort <= 65535) {
+      const normalized = `${window.location.protocol}//${backendHost}:${backendPort}`
+      window.sessionStorage.setItem(API_BASE_OVERRIDE_KEY, normalized)
+      return normalized
+    }
+
+    const stored = window.sessionStorage.getItem(API_BASE_OVERRIDE_KEY)?.trim()
+    if (stored) {
+      return normalizeBaseUrl(stored)
+    }
+  } catch {
+    return fallbackBase
+  }
+
+  return fallbackBase
+}
 
 type RequestOptions = RequestInit & {
   timeoutMs?: number
@@ -312,6 +366,106 @@ export const api = {
       body: JSON.stringify({ userId, message }),
       timeoutMs: 130000,
       retry: 1
+    })
+  },
+
+  async sendChatStream(userId: string, message: string, handlersOrSessionId?: ChatStreamHandlers | string, sessionIdOrHandlers?: string | ChatStreamHandlers): Promise<ChatResponse | null> {
+    let handlers: ChatStreamHandlers = {}
+    let sessionId = ''
+
+    // Handle overloaded parameters
+    if (typeof handlersOrSessionId === 'string') {
+      sessionId = handlersOrSessionId
+      handlers = (typeof sessionIdOrHandlers === 'object' ? sessionIdOrHandlers : {}) as ChatStreamHandlers
+    } else if (typeof handlersOrSessionId === 'object') {
+      handlers = handlersOrSessionId
+      sessionId = typeof sessionIdOrHandlers === 'string' ? sessionIdOrHandlers : ''
+    }
+
+    const controller = new AbortController()
+    const timeoutHandle = window.setTimeout(() => controller.abort(), 130000)
+
+    try {
+      const response = await fetch(`${API_BASE}/api/chat/stream`, {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ userId, message, sessionId })
+      })
+
+      if (!response.ok) {
+        const errorText = await response.text()
+        throw new Error(`Request failed: ${response.status}${errorText ? ` ${errorText}` : ''}`)
+      }
+
+      if (!response.body) {
+        throw new Error('Stream body is unavailable')
+      }
+
+      const decoder = new TextDecoder('utf-8')
+      const reader = response.body.getReader()
+      let pending = ''
+      let finalPayload: ChatResponse | null = null
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) {
+          break
+        }
+
+        pending += decoder.decode(value, { stream: true })
+        let boundaryIndex = pending.indexOf('\n\n')
+        while (boundaryIndex >= 0) {
+          const rawEvent = pending.slice(0, boundaryIndex)
+          pending = pending.slice(boundaryIndex + 2)
+          const parsed = parseSseEvent(rawEvent)
+
+          if (parsed.event === 'start') {
+            handlers.onStart?.()
+          } else if (parsed.event === 'progress') {
+            try {
+              const progress = JSON.parse(parsed.data) as ChatStreamProgress
+              handlers.onProgress?.(progress)
+            } catch {
+              handlers.onProgress?.({ index: 0, total: 0, step: parsed.data || '分析中' })
+            }
+          } else if (parsed.event === 'delta') {
+            handlers.onDelta?.(parsed.data)
+          } else if (parsed.event === 'final') {
+            try {
+              finalPayload = JSON.parse(parsed.data) as ChatResponse
+              handlers.onFinal?.(finalPayload)
+            } catch {
+              throw new Error('Invalid final stream payload')
+            }
+          } else if (parsed.event === 'error') {
+            handlers.onError?.(parsed.data)
+            throw new Error(parsed.data || 'stream_error')
+          } else if (parsed.event === 'done') {
+            handlers.onDone?.()
+          }
+
+          boundaryIndex = pending.indexOf('\n\n')
+        }
+      }
+
+      return finalPayload
+    } catch (error) {
+      const isAbort = error instanceof DOMException && error.name === 'AbortError'
+      const normalizedError = isAbort ? new Error('Request timeout') : error
+      handlers.onError?.(normalizedError instanceof Error ? normalizedError.message : 'stream_error')
+      throw normalizedError
+    } finally {
+      window.clearTimeout(timeoutHandle)
+    }
+  },
+
+  async sendChatQuick(userId: string, message: string, sessionId = ''): Promise<ChatResponse> {
+    return request<ChatResponse>('/api/chat/quick', {
+      method: 'POST',
+      body: JSON.stringify({ userId, message, sessionId })
     })
   },
 
@@ -428,5 +582,57 @@ export const api = {
       body: JSON.stringify(payload),
       timeoutMs: 15000
     })
+  },
+
+  async syncMonitorAccountPresence(accountKey: string, online: boolean, port: number): Promise<void> {
+    const response = await fetch(`${MONITOR_API_BASE}/api/monitor/account/presence`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Monitor-Token': MONITOR_CONTROL_TOKEN
+      },
+      body: JSON.stringify({
+        accountKey,
+        online,
+        port,
+        host: '127.0.0.1',
+        token: MONITOR_CONTROL_TOKEN
+      })
+    })
+
+    if (!response.ok) {
+      const errorText = await response.text()
+      throw new Error(`Monitor presence sync failed: ${response.status}${errorText ? ` ${errorText}` : ''}`)
+    }
+  }
+}
+
+type ParsedSseEvent = {
+  event: string
+  data: string
+}
+
+const parseSseEvent = (rawEvent: string): ParsedSseEvent => {
+  const lines = rawEvent
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean)
+
+  let event = 'message'
+  const data: string[] = []
+
+  for (const line of lines) {
+    if (line.startsWith('event:')) {
+      event = line.slice('event:'.length).trim() || 'message'
+      continue
+    }
+    if (line.startsWith('data:')) {
+      data.push(line.slice('data:'.length).trim())
+    }
+  }
+
+  return {
+    event,
+    data: data.join('\n')
   }
 }

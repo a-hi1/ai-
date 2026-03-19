@@ -147,6 +147,49 @@ public final class MonitorHttpWebSocketHandler extends SimpleChannelInboundHandl
             return;
         }
 
+        if (HttpMethod.POST.equals(request.method()) && matches(path, "/api/monitor/service/add-port", "/monitor/service/add-port")) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> payload = MonitorProtocol.MAPPER.readValue(request.content().toString(StandardCharsets.UTF_8), Map.class);
+            Integer port = payload == null ? null : MonitorProtocol.intValue(payload.get("port"));
+            String host = MonitorProtocol.stringValue(payload == null ? null : payload.get("host"));
+            String serviceName = MonitorProtocol.stringValue(payload == null ? null : payload.get("serviceName"));
+            String serverType = MonitorProtocol.stringValue(payload == null ? null : payload.get("serverType"));
+            String accountKey = MonitorProtocol.stringValue(payload == null ? null : payload.get("accountKey"));
+            String token = MonitorProtocol.stringValue(payload == null ? null : payload.get("token"));
+            if (token.isBlank()) {
+                token = MonitorProtocol.stringValue(request.headers().get("X-Monitor-Token"));
+            }
+            var result = registry.addManualServicePort(port, host, serviceName, serverType, token, accountKey);
+            HttpResponseStatus status = result.accepted() ? HttpResponseStatus.OK : HttpResponseStatus.BAD_REQUEST;
+            writeJsonResponse(ctx, status, MonitorProtocol.MAPPER.writeValueAsString(result));
+            return;
+        }
+
+        if (HttpMethod.POST.equals(request.method()) && matches(path, "/api/monitor/account/presence", "/monitor/account/presence")) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> payload = MonitorProtocol.MAPPER.readValue(request.content().toString(StandardCharsets.UTF_8), Map.class);
+            String accountKey = MonitorProtocol.stringValue(payload == null ? null : payload.get("accountKey"));
+            Boolean online = null;
+            if (payload != null && payload.containsKey("online")) {
+                Object rawOnline = payload.get("online");
+                if (rawOnline instanceof Boolean boolValue) {
+                    online = boolValue;
+                } else {
+                    online = Boolean.parseBoolean(MonitorProtocol.stringValue(rawOnline));
+                }
+            }
+            Integer port = payload == null ? null : MonitorProtocol.intValue(payload.get("port"));
+            String host = MonitorProtocol.stringValue(payload == null ? null : payload.get("host"));
+            String token = MonitorProtocol.stringValue(payload == null ? null : payload.get("token"));
+            if (token.isBlank()) {
+                token = MonitorProtocol.stringValue(request.headers().get("X-Monitor-Token"));
+            }
+            var result = registry.updateAccountPresence(accountKey, online, port, host, token);
+            HttpResponseStatus status = result.accepted() ? HttpResponseStatus.OK : HttpResponseStatus.BAD_REQUEST;
+            writeJsonResponse(ctx, status, MonitorProtocol.MAPPER.writeValueAsString(result));
+            return;
+        }
+
         writeJsonResponse(
             ctx,
             HttpResponseStatus.NOT_FOUND,

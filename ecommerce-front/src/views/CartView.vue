@@ -4,7 +4,6 @@
       <div>
         <p class="eyebrow">Checkout</p>
         <h1>购物车</h1>
-        <p class="copy">保留必要信息，确认数量后直接结算。</p>
       </div>
       <div class="head-metrics">
         <article class="metric-card">
@@ -25,7 +24,6 @@
         <header class="cart-header">
           <div>
             <h2>已选商品</h2>
-            <p>{{ cartItems.length ? '支持直接点开商品详情继续查看信息。' : '还没有加入商品。' }}</p>
           </div>
           <button class="clear" :disabled="!cartItems.length" @click="clearCurrentCart">清空</button>
         </header>
@@ -34,7 +32,6 @@
 
         <div v-if="!cartItems.length" class="empty-state">
           <strong>购物车还是空的</strong>
-          <p>可以先去商城直接挑商品，或者去导购页按需求缩小范围。</p>
           <div class="empty-actions">
             <RouterLink class="ghost-link" to="/shop">去商城</RouterLink>
             <RouterLink class="ghost-link" to="/chat">去导购</RouterLink>
@@ -47,7 +44,6 @@
               <img :src="item.image" :alt="item.name" loading="lazy" decoding="async" />
               <div class="info">
                 <div class="name">{{ item.name }}</div>
-                <div class="desc">{{ item.desc || '查看商品详情与购买信息' }}</div>
                 <div class="price">{{ formatCurrency(item.price) }}</div>
               </div>
             </button>
@@ -78,14 +74,11 @@
         <div class="payment-mode-group">
           <button class="payment-mode" :class="{ active: paymentMode === 'demo' }" type="button" @click="paymentMode = 'demo'">
             <strong>快速演示</strong>
-            <span>本地立即回调，适合联调订单流转。</span>
           </button>
           <button class="payment-mode" :class="{ active: paymentMode === 'alipay' }" type="button" @click="paymentMode = 'alipay'">
             <strong>支付宝沙箱</strong>
-            <span>跳转官方沙箱收银台，验证真实支付回跳。</span>
           </button>
         </div>
-        <p class="payment-hint">{{ paymentMode === 'alipay' ? '将按本次下单强制请求支付宝沙箱支付。如果沙箱配置未完成，页面会直接提示原因。' : '本地环境默认优先走站内快速支付，避免支付宝沙箱响应慢导致无法完成下单验证。' }}</p>
         <div class="checkout-row total">
           <span>应付金额</span>
           <strong>{{ formatCurrency(Number(totalPrice)) }}</strong>
@@ -94,7 +87,7 @@
           {{ paying ? '正在跳转...' : '立即支付' }}
         </button>
         <RouterLink class="back-link" to="/shop">继续逛商城</RouterLink>
-        <RouterLink class="back-link muted" to="/chat">回导购页补充挑选</RouterLink>
+        <RouterLink class="back-link" to="/chat">回导购页补充挑选</RouterLink>
       </aside>
     </div>
   </section>

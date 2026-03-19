@@ -170,7 +170,7 @@ public class MonitorClient implements ApplicationRunner, DisposableBean {
         boolean shouldShutdown = false;
 
         if ("RESTART".equals(action)) {
-            RestartOutcome restartOutcome = launchRestartScript();
+            RestartOutcome restartOutcome = launchRestartScript(command);
             result = restartOutcome.success() ? "SUCCESS" : "ERROR";
             message = restartOutcome.message();
             shouldShutdown = restartOutcome.success();
@@ -202,19 +202,21 @@ public class MonitorClient implements ApplicationRunner, DisposableBean {
         }
     }
 
-    private RestartOutcome launchRestartScript() {
+    private RestartOutcome launchRestartScript(MonitorAgentCommand commandMessage) {
         try {
             Path restartScript = resolveRestartScript();
             if (restartScript == null) {
                 return new RestartOutcome(false, "Restart script not found. Configure MONITOR_RESTART_SCRIPT first.");
             }
 
-            List<String> command = buildRestartCommand(restartScript);
-            ProcessBuilder processBuilder = new ProcessBuilder(command);
+            List<String> restartCommand = buildRestartCommand(restartScript, commandMessage);
+            ProcessBuilder processBuilder = new ProcessBuilder(restartCommand);
             Path workingDirectory = restartScript.getParent();
             if (workingDirectory != null && Files.exists(workingDirectory)) {
                 processBuilder.directory(workingDirectory.toFile());
             }
+            processBuilder.redirectOutput(ProcessBuilder.Redirect.DISCARD);
+            processBuilder.redirectError(ProcessBuilder.Redirect.DISCARD);
             processBuilder.start();
             return new RestartOutcome(true, "Restart script launched: " + restartScript);
         } catch (Exception ex) {
@@ -222,12 +224,95 @@ public class MonitorClient implements ApplicationRunner, DisposableBean {
         }
     }
 
-    private List<String> buildRestartCommand(Path restartScript) {
+    private List<String> buildRestartCommand(Path restartScript, MonitorAgentCommand commandMessage) {
         String script = restartScript.toAbsolutePath().normalize().toString();
+        Map<String, String> args = commandMessage == null || commandMessage.args() == null ? Map.of() : commandMessage.args();
         if (isWindows()) {
-            return List.of("cmd", "/c", "start", "", "powershell", "-ExecutionPolicy", "Bypass", "-File", script);
+            String scriptName = restartScript.getFileName() == null
+                    ? ""
+                    : restartScript.getFileName().toString().toLowerCase(Locale.ROOT);
+            String action = "restart";
+            String serviceName = nonBlank(args.get("serviceName"));
+            if (serviceName.isBlank()) {
+                serviceName = nonBlank(properties.getServiceName());
+            }
+            if (serviceName.isBlank()) {
+                serviceName = "ecommerce-backend";
+            }
+
+            String serverType = nonBlank(args.get("serverType"));
+            if (serverType.isBlank()) {
+                serverType = nonBlank(properties.getServerType());
+            }
+            if (serverType.isBlank()) {
+                serverType = "backend";
+            }
+
+            String advertiseHost = nonBlank(args.get("host"));
+            if (advertiseHost.isBlank()) {
+                advertiseHost = nonBlank(properties.getAdvertiseHost());
+            }
+            if (advertiseHost.isBlank()) {
+                advertiseHost = "127.0.0.1";
+            }
+
+            int advertisePort = parsePort(args.get("port"), properties.getAdvertisePort());
+
+            String serviceId = nonBlank(args.get("serviceId"));
+            if (serviceId.isBlank()) {
+                serviceId = nonBlank(properties.getServiceId());
+            }
+            if (serviceId.isBlank()) {
+                serviceId = serviceName + '@' + advertiseHost + ':' + advertisePort;
+            }
+
+            String runtimeName = nonBlank(args.get("runtimeName"));
+            if (runtimeName.isBlank()) {
+                runtimeName = serviceId.replaceAll("[^a-zA-Z0-9._-]", "-");
+            }
+
+            List<String> command = new ArrayList<>();
+            command.add("powershell");
+            command.add("-ExecutionPolicy");
+            command.add("Bypass");
+            command.add("-File");
+            command.add(script);
+            command.add("-Action");
+            command.add(action);
+            command.add("-ServiceName");
+            command.add(serviceName);
+            command.add("-ServerType");
+            command.add(serverType);
+            if ("start-ecommerce-backend.ps1".equals(scriptName)) {
+                command.add("-AppPort");
+            } else {
+                command.add("-Port");
+            }
+            command.add(String.valueOf(advertisePort));
+            command.add("-AdvertiseHost");
+            command.add(advertiseHost);
+            command.add("-RuntimeName");
+            command.add(runtimeName);
+            command.add("-ServiceId");
+            command.add(serviceId);
+            return command;
         }
         return List.of("sh", script);
+    }
+
+    private String nonBlank(String value) {
+        return value == null ? "" : value.trim();
+    }
+
+    private int parsePort(String raw, int fallback) {
+        try {
+            int parsed = Integer.parseInt(nonBlank(raw));
+            if (parsed >= 1 && parsed <= 65535) {
+                return parsed;
+            }
+        } catch (Exception ignored) {
+        }
+        return fallback;
     }
 
     private Path resolveRestartScript() {

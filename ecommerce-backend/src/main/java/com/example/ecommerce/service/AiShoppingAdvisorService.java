@@ -1,14 +1,18 @@
 package com.example.ecommerce.service;
 
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.math.BigDecimal;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
@@ -34,42 +38,85 @@ import com.example.ecommerce.service.ai.DirectShoppingAdvisorAiService;
 import com.example.ecommerce.service.ai.ShoppingAdvisorAiService;
 import com.example.ecommerce.service.ai.ShoppingAdvisorTools;
 
-import dev.langchain4j.service.AiServices;
+import dev.langchain4j.memory.ChatMemory;
+import dev.langchain4j.memory.chat.ChatMemoryProvider;
+import dev.langchain4j.memory.chat.MessageWindowChatMemory;
 import dev.langchain4j.model.chat.ChatLanguageModel;
-import dev.langchain4j.model.openai.Http11OpenAiChatModel;
 import dev.langchain4j.model.openai.OpenAiChatModel;
+import dev.langchain4j.service.AiServices;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 @Service
 public class AiShoppingAdvisorService {
-    private static final Pattern BUDGET_PATTERN = Pattern.compile("(\\d{2,6})\\s*(元|块|rmb)", Pattern.CASE_INSENSITIVE);
-    private static final Pattern FLEX_BUDGET_PATTERN = Pattern.compile("(?:预算|价位|控制在|不超过|以内)?\\s*(\\d{2,6})\\s*(?:元|块|rmb|人民币|以内)?", Pattern.CASE_INSENSITIVE);
-    private static final String INTENT_LIFE_SUPPLIES = "\u751f\u6d3b\u7528\u54c1";
-    private static final String INTENT_APPAREL = "服饰";
-    private static final int MAX_RECOMMENDATIONS = 3;
-    private static final int MIN_REALTIME_ATTEMPTS = 2;
-    private static final int MAX_REALTIME_ATTEMPTS = 4;
     private static final Logger log = LoggerFactory.getLogger(AiShoppingAdvisorService.class);
+
+    private static final Pattern STRICT_BUDGET_PATTERN = Pattern.compile("(?:预算|价位|控制在|不超过|以内)?\\s*(\\d{2,6})\\s*(?:元|块|rmb|人民币|以内)?", Pattern.CASE_INSENSITIVE);
+    private static final int MAX_MAIN_RECOMMENDATIONS = 3;
+    private static final List<String> GENERIC_ACCEPT_WORDS = List.of("都可以", "随便", "无所谓", "你定", "你决定", "没要求", "一般就行");
+    private static final int MIN_REQUIRED_DIMENSIONS_TO_RECOMMEND = 3;
+    private static final int MIN_REQUIRED_DIMENSIONS_WITHOUT_AI = 4;
+    private static final int MAX_CLARIFICATION_TURNS = 3;
+    private static final int MIN_CLARIFICATION_TURNS = 1;
+    private static final List<String> FOLLOW_UP_WORDS = List.of("这个", "这个吧", "就这个", "可以", "行", "好", "按你说的", "继续", "嗯", "对", "是的");
+    private static final List<String> CATEGORY_SWITCH_SIGNALS = List.of("换个", "改要", "还想要", "另外要", "再要", "还要一个", "我再问", "对了", "顺便问", "帮我也");
+
+    private static final Map<String, List<String>> INTENT_KEYWORDS = Map.ofEntries(
+            Map.entry("耳机", List.of("耳机", "headphone", "audio", "buds", "airpods", "freebuds", "降噪")),
+            Map.entry("笔记本", List.of("笔记本", "电脑", "laptop", "notebook", "轻薄本", "游戏本", "办公本")),
+            Map.entry("手机", List.of("手机", "phone", "smartphone", "iphone", "安卓", "鸿蒙")),
+            Map.entry("平板", List.of("平板", "tablet", "ipad")),
+            Map.entry("背包", List.of("背包", "双肩包", "书包", "通勤包", "backpack", "rucksack")),
+            Map.entry("箱包配饰", List.of("箱包", "行李箱", "挎包", "斜挎", "手提包", "钱包", "配饰")),
+            Map.entry("键盘", List.of("键盘", "keyboard")),
+            Map.entry("鼠标", List.of("鼠标", "mouse")),
+            Map.entry("手表", List.of("手表", "watch")),
+            Map.entry("手环", List.of("手环", "band")),
+            Map.entry("充电器", List.of("充电器", "快充", "charger", "氮化镓", "充电头")),
+            Map.entry("播放器", List.of("mp3", "播放器", "随身听", "音乐播放器")),
+            Map.entry("游戏机", List.of("游戏机", "console", "switch", "掌机")),
+            Map.entry("宠物", List.of("宠物", "猫粮", "狗粮", "宠粮", "猫砂", "宠物包")),
+            Map.entry("生活用品", List.of("生活用品", "日用", "清洁", "纸品", "抽纸", "纸巾", "洗衣液", "洗洁精")),
+            Map.entry("食品生鲜", List.of("食品", "生鲜", "零食", "饮料", "牛奶", "咖啡", "粮油", "水果")),
+            Map.entry("家居家具", List.of("家居", "家具", "收纳", "床品", "厨具")),
+            Map.entry("个护美妆", List.of("个护", "美妆", "护肤", "彩妆", "洗护", "面膜", "精华", "口红")),
+            Map.entry("鞋靴", List.of("鞋", "跑鞋", "球鞋", "皮鞋", "靴")),
+            Map.entry("服饰", List.of("衣服", "外套", "t恤", "服饰", "穿搭", "夹克", "衬衫")),
+            Map.entry("电子数码", List.of("数码", "外设", "音箱", "显示器", "蓝牙", "type-c")),
+            Map.entry("个护母婴", List.of("母婴", "奶粉", "纸尿裤", "湿巾", "婴儿", "宝宝")),
+            Map.entry("母婴玩具", List.of("母婴", "婴儿", "宝宝", "玩具", "启蒙", "安抚"))
+    );
 
     private final AiProperties aiProperties;
     private final RetrievalGatewayService retrievalGatewayService;
     private final ProductRecommendationService productRecommendationService;
+    private final AdvisorKnowledgeBaseService advisorKnowledgeBaseService;
     private final ChatMessageRepository chatMessageRepository;
     private final OrderItemRepository orderItemRepository;
     private final ProductRepository productRepository;
     private final ShoppingAdvisorTools shoppingAdvisorTools;
+    @SuppressWarnings("unused")
     private final AdvisorToolContext advisorToolContext;
 
     private volatile ChatLanguageModel chatLanguageModel;
     private volatile ShoppingAdvisorAiService shoppingAdvisorAiService;
     private volatile DirectShoppingAdvisorAiService directShoppingAdvisorAiService;
+
+    private final ConcurrentMap<String, ChatMemory> shoppingAdvisorMemories = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, ChatMemory> directAdvisorMemories = new ConcurrentHashMap<>();
+
+    private final ChatMemoryProvider shoppingAdvisorMemoryProvider = memoryId -> shoppingAdvisorMemories
+            .computeIfAbsent(String.valueOf(memoryId), ignored -> MessageWindowChatMemory.withMaxMessages(20));
+    private final ChatMemoryProvider directAdvisorMemoryProvider = memoryId -> directAdvisorMemories
+            .computeIfAbsent(String.valueOf(memoryId), ignored -> MessageWindowChatMemory.withMaxMessages(20));
+
     private final AtomicReference<AiRuntimeStatus> runtimeStatusRef = new AtomicReference<>();
     private final AtomicInteger consecutiveFallbacks = new AtomicInteger();
 
     public AiShoppingAdvisorService(AiProperties aiProperties,
                                     RetrievalGatewayService retrievalGatewayService,
                                     ProductRecommendationService productRecommendationService,
+                                    AdvisorKnowledgeBaseService advisorKnowledgeBaseService,
                                     ChatMessageRepository chatMessageRepository,
                                     OrderItemRepository orderItemRepository,
                                     ProductRepository productRepository,
@@ -78,183 +125,95 @@ public class AiShoppingAdvisorService {
         this.aiProperties = aiProperties;
         this.retrievalGatewayService = retrievalGatewayService;
         this.productRecommendationService = productRecommendationService;
+        this.advisorKnowledgeBaseService = advisorKnowledgeBaseService;
         this.chatMessageRepository = chatMessageRepository;
         this.orderItemRepository = orderItemRepository;
         this.productRepository = productRepository;
         this.shoppingAdvisorTools = shoppingAdvisorTools;
         this.advisorToolContext = advisorToolContext;
-        this.runtimeStatusRef.set(AiRuntimeStatus.initial(currentProviderName(), activeModelName()));
+        runtimeStatusRef.set(AiRuntimeStatus.initial(currentProviderName(), activeModelName()));
     }
 
-    public Mono<ChatAdvicePayload> advise(UUID userId, String message) {
+    public Mono<ChatAdvicePayload> advise(UUID userId, String message, String sessionId) {
+        // 🔒 会话隔离：按 sessionId 查询消息，防止新会话使用旧会话的历史记录
+        String effectiveSessionId = (sessionId == null || sessionId.trim().isEmpty()) ? "default" : sessionId;
+        
         return Mono.zip(
-                        retrievalGatewayService.search(message, 6, null, null).map(RetrievalGatewayService.RetrievalChunk::product).collectList(),
-                        orderItemRepository.findAll().collectList(),
+                        // ✅ 改为按 sessionId 过滤，确保新会话不会继承旧会话的数据
+                        chatMessageRepository.findByUserIdAndSessionId(userId, effectiveSessionId).collectList(),
+                        retrievalGatewayService.search(message, 16, null, null)
+                                .map(RetrievalGatewayService.RetrievalChunk::product)
+                                .collectList(),
                         productRepository.findAll().collectList(),
-                        chatMessageRepository.findByUserId(userId).collectList())
-                .flatMap(tuple -> {
-                    BigDecimal budget = extractBudget(message);
-                    String intentCategory = detectIntentCategory(message);
-                    String detectedIntent = formatIntentLabel(intentCategory, message);
-                List<ChatMessage> history = tuple.getT4();
-                List<Product> allCandidateProducts = mergeProducts(tuple.getT1(), tuple.getT3());
-                    List<Product> intentProducts = filterByIntent(message, allCandidateProducts);
-                    List<Product> budgetMatchedProducts = budget == null
-                            ? intentProducts
-                            : intentProducts.stream()
-                                    .filter(product -> product.getPrice() != null && product.getPrice().compareTo(budget) <= 0)
-                                    .toList();
-                List<OrderItem> soldItems = tuple.getT2();
-                    Map<UUID, Integer> sales = aggregateSales(soldItems);
-                    boolean noProductWithinBudget = budget != null && budgetMatchedProducts.isEmpty();
-                List<Product> fallbackBaseProducts = rankProducts(message,
-                    budgetMatchedProducts.isEmpty() ? intentProducts : budgetMatchedProducts,
-                    sales,
-                    budget);
+                        orderItemRepository.findAll().collectList())
+                .flatMap(tuple -> Mono.fromCallable(() -> buildAdvice(userId, message, effectiveSessionId, tuple.getT1(), tuple.getT2(), tuple.getT3(), tuple.getT4()))
+                        .subscribeOn(Schedulers.boundedElastic()));
+    }
 
-                if (fallbackBaseProducts.isEmpty()) {
-                        return Mono.just(buildFallbackPayload(
-                                "需求速览：当前商品库里还没有命中完全匹配的结果。\n\n建议你补充预算、用途、品牌偏好，或者直接描述具体场景，例如“通勤降噪耳机”“轻薄办公本”“运动健康手表”，我会继续按商品库为你缩小范围。",
-                                List.of(),
-                                List.of(),
-                    buildInsights(detectedIntent, budget, List.of(), sales, noProductWithinBudget, message),
-                                detectedIntent,
-                                formatBudgetSummary(budget),
-                                "NO_RANKED_PRODUCTS"));
+    public Mono<ChatAdvicePayload> adviseQuick(UUID userId, String message, String sessionId) {
+        // 【快速模式】跳过知识库澄清，直接推荐
+        // 1. 快速提取预算和核心需求
+        // 2. 向量搜索和排名
+        // 3. 返回简洁建议（2-3 句话）
+        String effectiveSessionId = (sessionId == null || sessionId.trim().isEmpty()) ? "default" : sessionId;
+        
+        return Mono.zip(
+                        retrievalGatewayService.search(message, 12, null, null)
+                                .map(RetrievalGatewayService.RetrievalChunk::product)
+                                .collectList(),
+                        productRepository.findAll().collectList(),
+                        orderItemRepository.findAll().collectList())
+                .flatMap(tuple -> Mono.fromCallable(() -> {
+                    List<Product> retrievedProducts = tuple.getT1();
+                    List<Product> allProducts = tuple.getT2();
+                    List<OrderItem> soldItems = tuple.getT3();
+                    
+                    // 快速提取预算
+                    BigDecimal budget = resolveBudget(message, List.of());
+                    String intent = resolveIntent(message, List.of());
+                    
+                    if (isBlank(intent)) {
+                        intent = inferIntentFromProducts(retrievedProducts);
                     }
-
-                if (!supportsToolCalling()) {
-                    return generateDirectRealtimeAdvice(message, fallbackBaseProducts, history, soldItems, budget, noProductWithinBudget)
-                        .flatMap(reply -> productRecommendationService.recommendRelatedProducts(fallbackBaseProducts, 3)
-                            .map(relatedRecommendations -> {
-                                String normalizedReply = normalizeReply(reply);
-                                List<ChatInsightResponse> bypassInsights = appendDirectAiBypassInsights(
-                                    buildInsights(detectedIntent, budget, fallbackBaseProducts, sales, noProductWithinBudget, message),
-                                    activeModelName());
-                                List<ChatRecommendationResponse> recs = buildRecommendations(message, fallbackBaseProducts, sales, budget);
-                                if (normalizedReply == null) {
-                                    log.warn("AI direct path returned blank reply for provider={} model={}",
-                                        currentProviderName(), activeModelName());
-                                    return buildFallbackPayload(
-                                        buildFallbackReply(message, fallbackBaseProducts, soldItems, budget, noProductWithinBudget),
-                                        recs, relatedRecommendations, bypassInsights,
-                                        detectedIntent, formatBudgetSummary(budget),
-                                        "AI_RETURNED_EMPTY_REPLY");
-                                }
-                                return buildSuccessPayload(normalizedReply, recs, relatedRecommendations,
-                                    bypassInsights, detectedIntent, formatBudgetSummary(budget));
-                            }))
-                        .onErrorResume(error -> productRecommendationService.recommendRelatedProducts(fallbackBaseProducts, 3)
-                            .map(relatedRecommendations -> buildFallbackPayload(
-                                buildFallbackReply(message, fallbackBaseProducts, soldItems, budget, noProductWithinBudget),
-                                buildRecommendations(message, fallbackBaseProducts, sales, budget),
-                                relatedRecommendations,
-                                buildInsights(detectedIntent, budget, fallbackBaseProducts, sales, noProductWithinBudget, message),
-                                detectedIntent,
-                                formatBudgetSummary(budget),
-                                "AI_DIRECT_CALL_FAILED: " + summarizeError(error))));
-                }
-
-                return generateRealtimeAdvice(userId, message)
-                    .flatMap(execution -> {
-                    List<Product> toolProducts = execution.snapshot().hasProducts()
-                        ? mergeProducts(execution.snapshot().products(), fallbackBaseProducts)
-                        : fallbackBaseProducts;
-                    List<Product> rankedProducts = rankProducts(message, filterByIntent(message, toolProducts), sales, budget);
-                    if (rankedProducts.isEmpty()) {
-                        return Mono.just(buildFallbackPayload(
-                            buildFallbackReply(message, fallbackBaseProducts, soldItems, budget, noProductWithinBudget),
-                            buildRecommendations(message, fallbackBaseProducts, sales, budget),
-                            List.of(),
-                            appendToolInsights(buildInsights(detectedIntent, budget, fallbackBaseProducts, sales, noProductWithinBudget, message), execution.snapshot()),
-                            detectedIntent,
-                            formatBudgetSummary(budget),
-                            "AI_TOOLS_RETURNED_NO_PRODUCTS"));
+                    
+                    Map<UUID, Integer> salesMap = aggregateSales(soldItems);
+                    List<Product> ranked = rankAndFilterProducts(message, budget, intent, retrievedProducts, allProducts, salesMap);
+                    
+                    if (ranked.isEmpty()) {
+                        String reply = "按你的条件没找到完全匹配产品，建议放宽条件试试。";
+                        return new ChatAdvicePayload(reply, List.of(), List.of(), List.of(), intent, budgetSummary(budget), true);
                     }
+                    
+                    // 快速推荐：仅前3件 + 简洁文案
+                    List<ChatRecommendationResponse> recommendations = toRecommendations(ranked, salesMap, budget);
+                    String quickReply = formatQuickRecommendationReply(intent, budget, ranked);
+                    
+                    recordSuccess();
+                    return new ChatAdvicePayload(quickReply, recommendations, List.of(), List.of(), intent, budgetSummary(budget), false);
+                }).subscribeOn(Schedulers.boundedElastic()));
+    }
 
-                        List<ChatRecommendationResponse> recommendations = buildRecommendations(
-                            message,
-                            preferStrictMainRecommendations(message, rankedProducts),
-                            sales,
-                            budget);
-                    List<ChatInsightResponse> insights = appendToolInsights(
-                        buildInsights(detectedIntent, budget, rankedProducts, sales, noProductWithinBudget, message),
-                        execution.snapshot());
-
-                    return productRecommendationService.recommendRelatedProducts(rankedProducts, 3)
-                        .map(relatedRecommendations -> {
-                            String normalizedReply = normalizeReply(execution.reply());
-                            if (normalizedReply == null) {
-                                log.warn("AI tool-call path returned blank reply for provider={} model={}",
-                                    currentProviderName(), activeModelName());
-                                return buildFallbackPayload(
-                                    buildFallbackReply(message, rankedProducts, soldItems, budget, noProductWithinBudget),
-                                    recommendations, relatedRecommendations, insights,
-                                    detectedIntent, formatBudgetSummary(budget),
-                                    "AI_RETURNED_EMPTY_REPLY");
-                            }
-                            return buildSuccessPayload(normalizedReply, recommendations, relatedRecommendations,
-                                insights, detectedIntent, formatBudgetSummary(budget));
-                        });
-                    })
-                    .onErrorResume(error -> {
-                        invalidateAiCaches();
-                        return generateDirectRealtimeAdvice(message, fallbackBaseProducts, history, soldItems, budget, noProductWithinBudget)
-                        .flatMap(reply -> productRecommendationService.recommendRelatedProducts(fallbackBaseProducts, 3)
-                            .map(relatedRecommendations -> {
-                                String normalizedReply = normalizeReply(reply);
-                                List<ChatInsightResponse> recoveryInsights = appendDirectAiRecoveryInsights(
-                                    buildInsights(detectedIntent, budget, fallbackBaseProducts, sales, noProductWithinBudget, message),
-                                    summarizeError(error));
-                                List<ChatRecommendationResponse> recs = buildRecommendations(message, fallbackBaseProducts, sales, budget);
-                                if (normalizedReply == null) {
-                                    log.warn("AI recovery direct path also returned blank reply, falling to rule-based");
-                                    return buildFallbackPayload(
-                                        buildFallbackReply(message, fallbackBaseProducts, soldItems, budget, noProductWithinBudget),
-                                        recs, relatedRecommendations, recoveryInsights,
-                                        detectedIntent, formatBudgetSummary(budget),
-                                        "AI_RETURNED_EMPTY_REPLY_IN_RECOVERY");
-                                }
-                                return buildSuccessPayload(normalizedReply, recs, relatedRecommendations,
-                                    recoveryInsights, detectedIntent, formatBudgetSummary(budget));
-                            }));
-                    })
-                    .onErrorResume(error -> productRecommendationService.recommendRelatedProducts(fallbackBaseProducts, 3)
-                        .map(relatedRecommendations -> buildFallbackPayload(
-                            buildFallbackReply(message, fallbackBaseProducts, soldItems, budget, noProductWithinBudget),
-                            buildRecommendations(message, fallbackBaseProducts, sales, budget),
-                            relatedRecommendations,
-                            buildInsights(detectedIntent, budget, fallbackBaseProducts, sales, noProductWithinBudget, message),
-                            detectedIntent,
-                            formatBudgetSummary(budget),
-                            "AI_TOOL_CALL_FAILED: " + summarizeError(error))));
-                })
-                .onErrorResume(error -> {
-                    String reason = "AI_PIPELINE_FAILED: " + summarizeError(error);
-                    log.error("AI advise failed, fallback as last resort. reason={}", reason, error);
-                    BigDecimal budget = extractBudget(message);
-                    String detectedIntent = formatIntentLabel(detectIntentCategory(message), message);
-                    return Mono.just(buildFallbackPayload(
-                            "需求速览：当前实时 AI 暂时不可用，已切换到兜底推荐结果。",
-                            List.of(),
-                            List.of(),
-                            buildInsights(detectedIntent, budget, List.of(), Map.of(), false, message),
-                            detectedIntent,
-                            formatBudgetSummary(budget),
-                            reason));
-                });
+    private String formatQuickRecommendationReply(String intent, BigDecimal budget, List<Product> products) {
+        // 生成2-3句的快速推荐
+        if (products.isEmpty()) {
+            return "暂无推荐";
+        }
+        
+        Product top = products.getFirst();
+        String budgetStr = budgetSummary(budget);
+        return "根据你的需求（" + blankToDefault(intent, "通用") + "，" + budgetStr + "），"
+                + "我最推荐这款：" + safe(top.getName()) + " (" + formatPrice(top.getPrice()) + " 元)。"
+                + "如需其他选项，下面还有备选款，点击查看详情。";
     }
 
     public String getRuntimeStatusSummary() {
         AiRuntimeStatus status = runtimeStatusRef.get();
-        StringBuilder builder = new StringBuilder();
-        builder.append("AI Provider: ").append(status.provider()).append("\n");
-        builder.append("模型名称: ").append(status.modelName()).append("\n");
-        builder.append("当前模式: ").append("NOT_CALLED_YET".equals(status.reason()) ? "待首个请求" : (status.fallback() ? "规则兜底" : "实时模型")).append("\n");
-        builder.append("最近原因: ").append(status.reason()).append("\n");
-        builder.append("连续兜底次数: ").append(status.consecutiveFallbacks()).append("\n");
-        builder.append("最近更新时间: ").append(status.updatedAt());
-        return builder.toString();
+        return "AI Provider: " + status.provider() + "\n"
+                + "模型名称: " + status.modelName() + "\n"
+                + "当前模式: " + (status.fallback() ? "规则兜底" : "实时模型") + "\n"
+                + "最近原因: " + status.reason() + "\n"
+                + "连续兜底次数: " + status.consecutiveFallbacks() + "\n"
+                + "最近更新时间: " + status.updatedAt();
     }
 
     public AiRuntimeStatus getRuntimeStatus() {
@@ -262,394 +221,1069 @@ public class AiShoppingAdvisorService {
     }
 
     public synchronized void reloadProviderConfiguration(String reason) {
-        chatLanguageModel = null;
-        shoppingAdvisorAiService = null;
-        consecutiveFallbacks.set(0);
-
-        String normalizedReason = isBlank(reason) ? previewConfigurationReason() : reason;
-        boolean fallback = !"READY".equalsIgnoreCase(normalizedReason)
-                && !"CONFIG_UPDATED".equalsIgnoreCase(normalizedReason)
-                && !"PERSISTED_CONFIG_LOADED".equalsIgnoreCase(normalizedReason);
-
-        runtimeStatusRef.set(new AiRuntimeStatus(
-                currentProviderName(),
-                activeModelName(),
-                fallback,
-                normalizedReason,
-                Instant.now(),
-                0));
+        invalidateAiCaches();
+        runtimeStatusRef.set(new AiRuntimeStatus(currentProviderName(), activeModelName(), false,
+                isBlank(reason) ? "CONFIG_RELOADED" : reason, Instant.now(), consecutiveFallbacks.get()));
     }
 
-    private String buildPrompt(String message,
-                               List<Product> products,
-                               List<ChatMessage> history,
-                               List<OrderItem> soldItems,
-                               BigDecimal budget,
-                               boolean noProductWithinBudget) {
-        Map<UUID, Integer> sales = aggregateSales(soldItems);
-        String demandSummary = buildDemandSummary(message, budget, history);
+    private ChatAdvicePayload buildAdvice(UUID userId,
+                                          String message,
+                                          String sessionId,
+                                          List<ChatMessage> history,
+                                          List<Product> retrievedProducts,
+                                          List<Product> allProducts,
+                                          List<OrderItem> soldItems) {
+        List<ChatMessage> effectiveHistory = extractEffectiveHistory(history, 12);
+        
+        // 检测是否是品类切换。如果是，过滤历史只保留最近的相关部分
+        boolean isCategorySwitch = detectCategorySwitch(message, effectiveHistory);
+        List<ChatMessage> contextualHistory = isCategorySwitch
+            ? filterHistoryForNewCategory(message, effectiveHistory)
+            : effectiveHistory;
+        
+        String currentIntent = detectIntent(message);
+        List<String> recentUserMessages = extractRecentUserMessages(contextualHistory, 6);
+        List<String> scopedUserMessages = extractIntentScopedUserMessages(contextualHistory, currentIntent, 6);
+        List<String> baseHistory = scopedUserMessages.isEmpty() ? recentUserMessages : scopedUserMessages;
+        List<String> inferenceHistory = shouldUseHistoryForInference(message, baseHistory)
+            ? baseHistory
+            : List.of();
+        int clarificationTurns = countRecentClarificationTurns(contextualHistory);
+        String mergedUserContext = mergeContext(message, inferenceHistory);
 
+        BigDecimal budget = resolveBudget(message, inferenceHistory);
+        String intent = resolveIntent(message, inferenceHistory);
+        if (isBlank(intent)) {
+            intent = inferIntentFromProducts(retrievedProducts);
+        }
+        String scene = resolveScene(message, inferenceHistory, intent, isCategorySwitch);
+        String functionPreference = resolveFunctionPreference(message, inferenceHistory, intent, isCategorySwitch);
+        String appearancePreference = resolveAppearancePreference(message, inferenceHistory, intent, isCategorySwitch);
+
+        boolean acceptsGenericPreference = acceptsGenericPreference(message, inferenceHistory);
+        if (acceptsGenericPreference) {
+            if (isBlank(scene)) {
+                scene = defaultSceneByIntent(intent);
+            }
+            if (isBlank(functionPreference)) {
+                functionPreference = defaultFunctionByIntent(intent);
+            }
+            if (isBlank(appearancePreference)) {
+                appearancePreference = "简约通用";
+            }
+        }
+
+        List<AdvisorKnowledgeBaseService.KnowledgeSnippet> snippets = advisorKnowledgeBaseService
+                .search(mergedUserContext, 4);
+        AdvisorKnowledgeBaseService.ClarificationPlan plan = advisorKnowledgeBaseService
+                .resolveClarificationPlan(intent, snippets);
+
+        List<String> missingDimensions = resolveMissingDimensions(plan, budget, scene, functionPreference, appearancePreference, intent);
+        int fulfilledDimensions = countFulfilledDimensions(budget, scene, functionPreference, appearancePreference, intent);
+        boolean aiReady = hasAvailableModelProvider();
+        
+        // 根据知识库计划动态调整澄清轮数
+        int adaptiveMaxClarificationTurns = calculateAdaptiveMaxTurns(plan, missingDimensions, snippets);
+        
+        if (!missingDimensions.isEmpty()) {
+            String dimensionToAsk = selectBestDimensionToAsk(missingDimensions, plan, contextualHistory, intent);
+
+            if (!dimensionToAsk.isBlank() && clarificationTurns < adaptiveMaxClarificationTurns) {
+                return buildClarificationPayload(intent, budget, dimensionToAsk, plan, snippets);
+            }
+
+            // 已连续澄清多轮时，自动补齐默认值并进入推荐，避免循环追问。
+            if (fulfilledDimensions < MIN_REQUIRED_DIMENSIONS_TO_RECOMMEND
+                    && clarificationTurns < adaptiveMaxClarificationTurns) {
+                return buildClarificationPayload(intent, budget, "preference", plan, snippets);
+            }
+
+            if (isBlank(intent)) {
+                intent = inferIntentFromProducts(retrievedProducts);
+            }
+            if (isBlank(scene)) {
+                scene = defaultSceneByIntent(intent);
+            }
+            if (isBlank(functionPreference)) {
+                functionPreference = defaultFunctionByIntent(intent);
+            }
+            if (isBlank(appearancePreference)) {
+                appearancePreference = acceptsGenericPreference ? "简约通用" : "主流通用";
+            }
+        }
+
+        if (countFulfilledDimensions(budget, scene, functionPreference, appearancePreference, intent) < MIN_REQUIRED_DIMENSIONS_TO_RECOMMEND
+                && clarificationTurns < adaptiveMaxClarificationTurns) {
+            return buildClarificationPayload(intent, budget, "preference", plan, snippets);
+        }
+
+        // 模型不可用时，提升澄清门槛，避免过早进入模板推荐导致“兜底感”过强。
+        if (!aiReady
+                && countFulfilledDimensions(budget, scene, functionPreference, appearancePreference, intent) < MIN_REQUIRED_DIMENSIONS_WITHOUT_AI
+                && clarificationTurns < adaptiveMaxClarificationTurns + 1) {
+            String dimensionToAsk = selectBestDimensionToAsk(missingDimensions, plan, contextualHistory, intent);
+            if (dimensionToAsk.isBlank()) {
+                dimensionToAsk = "preference";
+            }
+            return buildClarificationPayload(intent, budget, dimensionToAsk, plan, snippets);
+        }
+
+        Map<UUID, Integer> salesMap = aggregateSales(soldItems);
+        List<Product> ranked = rankAndFilterProducts(mergedUserContext, budget, intent, retrievedProducts, allProducts, salesMap);
+
+        if (ranked.isEmpty()) {
+            String reply = "我已经按你给的条件在商品库里筛了一轮，暂时没有完全匹配的款。"
+                    + "你可以告诉我是否放宽预算或功能要求，我马上给你第二版方案。";
+            recordFallback("NO_MATCHED_PRODUCTS");
+            return new ChatAdvicePayload(
+                    reply,
+                    List.of(),
+                    List.of(),
+                    buildInsights(intent, budget, snippets, true, "商品库无匹配结果"),
+                    detectedIntentLabel(intent, scene),
+                    budgetSummary(budget),
+                    true);
+        }
+
+        List<ChatRecommendationResponse> recommendations = toRecommendations(ranked, salesMap, budget);
+        List<Product> mainProducts = ranked.stream().limit(MAX_MAIN_RECOMMENDATIONS).toList();
+
+        String aiReply = generateRecommendationReply(userId, message, contextualHistory, budget, scene, intent,
+                functionPreference, appearancePreference, mainProducts, snippets, sessionId);
+
+        recordSuccess();
+        return new ChatAdvicePayload(
+                aiReply,
+                recommendations,
+            List.of(),
+                buildInsights(intent, budget, snippets, false, activeModelLabel()),
+                detectedIntentLabel(intent, scene),
+                budgetSummary(budget),
+                false);
+    }
+
+    private ChatAdvicePayload buildClarificationPayload(String intent,
+                                                        BigDecimal budget,
+                                                        String missingDimension,
+                                                        AdvisorKnowledgeBaseService.ClarificationPlan plan,
+                                                        List<AdvisorKnowledgeBaseService.KnowledgeSnippet> snippets) {
+        String question = safe(plan.questionByDimension(missingDimension));
+        if (question.isBlank()) {
+            question = "我先补一个关键信息，这样推荐不会跑偏：你最在意预算、场景还是功能？";
+        }
+
+        List<ChatInsightResponse> insights = new ArrayList<>();
+        insights.add(new ChatInsightResponse("导购阶段", "需求补全中"));
+        insights.add(new ChatInsightResponse("待确认维度", missingDimension));
+        insights.add(new ChatInsightResponse("知识库命中", String.valueOf(snippets.size())));
+        if (!snippets.isEmpty()) {
+            String topic = snippets.stream()
+                    .limit(2)
+                    .map(item -> safe(item.category()) + ":" + safe(item.title()))
+                    .collect(Collectors.joining(" | "));
+            insights.add(new ChatInsightResponse("参考知识", topic));
+        }
+
+        return new ChatAdvicePayload(
+                question,
+                List.of(),
+                List.of(),
+                insights,
+                detectedIntentLabel(intent, ""),
+                budgetSummary(budget),
+                false);
+    }
+
+    private String generateRecommendationReply(UUID userId,
+                                               String message,
+                                               List<ChatMessage> history,
+                                               BigDecimal budget,
+                                               String scene,
+                                               String intent,
+                                               String functionPreference,
+                                               String appearancePreference,
+                                               List<Product> products,
+                                               List<AdvisorKnowledgeBaseService.KnowledgeSnippet> snippets,
+                                               String sessionId) {
         String productContext = products.stream()
-                .map(product -> String.format("- 商品：%s；价格：%s 元；标签：%s；描述：%s；历史成交件数：%d",
-                        safe(product.getName()),
-                        formatPrice(product.getPrice()),
-                        safe(product.getTags()),
-                        safe(product.getDescription()),
-                        sales.getOrDefault(product.getId(), 0)))
+                .limit(MAX_MAIN_RECOMMENDATIONS)
+                .map(product -> "- 商品：" + safe(product.getName())
+                        + "；价格：" + formatPrice(product.getPrice()) + " 元"
+                        + "；标签：" + safe(product.getTags())
+                        + "；描述：" + safe(product.getDescription()))
                 .collect(Collectors.joining("\n"));
 
         String historyContext = history.stream()
-                .sorted(Comparator.comparing(ChatMessage::getCreatedAt))
+                .sorted(Comparator.comparing(ChatMessage::getCreatedAt, Comparator.nullsLast(Comparator.naturalOrder())))
                 .skip(Math.max(0, history.size() - 6L))
-                .map(item -> ("USER".equals(item.getRole()) ? "用户" : "助手") + "：" + item.getContent())
+                .map(item -> ("USER".equalsIgnoreCase(item.getRole()) ? "用户" : "助手") + "：" + safe(item.getContent()))
                 .collect(Collectors.joining("\n"));
 
-        return "你是中文电商导购助手，负责模拟线下专业导购，要求根据用户问题推荐商品。\n"
-                + "输出要求：\n"
-                + "1. 使用专业、清晰、有温度的中文导购语气。\n"
-                + "2. 第一段写“需求速览”，总结用户场景、预算和偏好。\n"
-                + "3. 第二段写“推荐清单”，从给定商品中推荐 2 到 3 个，每个商品必须写适合场景、核心卖点、价格。\n"
-                + "4. 第三段写“购买建议”，明确主推款和不同人群适合的差异。\n"
-                + "5. 只允许使用给定商品，不要虚构商品型号、价格、销量或库存。\n"
-                + "6. 如果有历史成交数据，可作为受欢迎程度参考，但不要夸大。\n"
-                + "7. 如果用户给了预算，优先推荐预算内商品；若预算内没有完全匹配的商品，必须明确提示并给出最接近预算的替代项。\n"
-            + "8. 如果用户需求还不够完整，允许你在回答中明确写出你的理解前提，但不要脱离上下文乱猜。\n"
-            + "9. 结尾提醒用户可以直接把推荐商品加入购物车，不要输出 Markdown 表格。\n\n"
-                + "用户本轮问题：" + message + "\n\n"
-            + "结构化需求摘要：\n" + demandSummary + "\n\n"
-                + "预算信息：" + formatBudgetSummary(budget) + "\n"
-                + "预算内是否有匹配商品：" + (noProductWithinBudget ? "没有，需要给替代方案" : "有") + "\n\n"
-                + "最近聊天记录：\n" + (historyContext.isBlank() ? "暂无" : historyContext) + "\n\n"
-                + "RAG 检索到的商品与成交信息：\n" + productContext;
-    }
-
-    private String buildFallbackReply(String message,
-                                      List<Product> products,
-                                      List<OrderItem> soldItems,
-                                      BigDecimal budget,
-                                      boolean noProductWithinBudget) {
-        Map<UUID, Integer> sales = aggregateSales(soldItems);
-        String sceneSummary = formatSceneSummary(message);
-
-        String recommendations = products.stream()
-                .limit(MAX_RECOMMENDATIONS)
-            .map(product -> buildFallbackRecommendation(product, message, sales.getOrDefault(product.getId(), 0), budget, products.indexOf(product) == 0))
+        String knowledgeContext = snippets.isEmpty()
+                ? "暂无命中，使用通用导购策略。"
+                : snippets.stream()
+                .limit(3)
+                .map(snippet -> "- [" + safe(snippet.category()) + "] " + safe(snippet.title()) + "：" + safe(snippet.summary()))
                 .collect(Collectors.joining("\n"));
 
-        String budgetNotice = noProductWithinBudget && budget != null
-            ? "预算内暂无完全匹配款，以下给你优先放最接近需求、且更容易实际落地的替代方案。"
-            : "以下推荐已经优先按你的场景、预算和已有成交热度做了排序。";
+        String prompt = "你是中文电商导购员“小选”。必须严格按以下规则回复：\n"
+                + "1. 只使用给定商品，不编造型号和价格。\n"
+            + "2. 输出结构：需求速览、主推1款、备选1-2款、购买建议。\n"
+            + "3. 每个推荐都要解释为何匹配用户场景，避免空泛话术。\n"
+            + "4. 语气像真人导购，简洁自然，不要 Markdown 表格。\n"
+            + "5. 不要重复追问已经给出的信息。\n\n"
+                + "用户本轮消息：" + safe(message) + "\n"
+                + "识别品类：" + blankToDefault(intent, "未识别") + "\n"
+                + "预算：" + budgetSummary(budget) + "\n"
+                + "场景：" + blankToDefault(scene, "未明确") + "\n"
+                + "功能偏好：" + blankToDefault(functionPreference, "未明确") + "\n"
+                + "外观偏好：" + blankToDefault(appearancePreference, "未明确") + "\n\n"
+                + "知识库片段：\n" + knowledgeContext + "\n\n"
+                + "最近对话：\n" + (historyContext.isBlank() ? "暂无" : historyContext) + "\n\n"
+                + "候选商品：\n" + productContext;
 
-        return "需求速览：\n"
-            + "- 需求类型：" + formatIntentLabel(detectIntentCategory(message), message) + "\n"
-            + "- 核心场景：" + sceneSummary + "\n"
-            + "- 预算范围：" + formatBudgetSummary(budget) + "\n"
-            + "- 推荐策略：" + budgetNotice + "\n\n"
-            + "推荐结论：\n"
-                + recommendations
-            + "\n\n购买建议：\n"
-            + "- 主推款优先满足你当前最核心的场景诉求，适合直接进入对比或加购。\n"
-            + "- 如果你更在意预算，我可以继续帮你压缩到更低价位；如果你更在意体验，我可以再按降噪、续航、便携或办公强度细分。\n"
-            + "- 你也可以直接点开商品详情，我会继续基于当前商品给你做搭配推荐。";
+        String conversationId = resolveRequestScopedConversationId(userId, sessionId);
+
+        try {
+            ShoppingAdvisorAiService toolService = getOrCreateShoppingAdvisorAiService();
+            if (toolService != null) {
+                String text = normalizeReply(toolService.chat(conversationId, prompt));
+                if (text != null) {
+                    return text;
+                }
+            }
+        } catch (Exception error) {
+            log.warn("Tool advisor call failed: {}", summarizeError(error));
+            invalidateAiCaches();
+        }
+
+        try {
+            DirectShoppingAdvisorAiService directService = getOrCreateDirectShoppingAdvisorAiService();
+            if (directService != null) {
+                String text = normalizeReply(directService.chat(conversationId, prompt));
+                if (text != null) {
+                    return text;
+                }
+            }
+        } catch (Exception error) {
+            log.warn("Direct advisor call failed: {}", summarizeError(error));
+            invalidateAiCaches();
+        }
+
+        recordFallback("AI_UNAVAILABLE_RULE_BASED_REPLY");
+        return buildRuleBasedReply(intent, budget, scene, products);
     }
 
-    private List<ChatRecommendationResponse> buildRecommendations(String message,
-                                                                  List<Product> products,
-                                                                  Map<UUID, Integer> sales,
-                                                                  BigDecimal budget) {
-        return products.stream()
-                .limit(MAX_RECOMMENDATIONS)
+    private String resolveRequestScopedConversationId(UUID userId, String sessionId) {
+        String base = userId == null ? "anonymous" : userId.toString();
+        String session = sessionId == null || sessionId.trim().isEmpty() ? "default" : sessionId;
+        // 每个会话都有独立的 conversationId：userId:sessionId
+        // 这样确保新对话会话不会继承之前会话的记忆
+        return base + ":" + session;
+    }
+
+    private List<Product> rankAndFilterProducts(String mergedUserContext,
+                                                BigDecimal budget,
+                                                String intent,
+                                                List<Product> retrievedProducts,
+                                                List<Product> allProducts,
+                                                Map<UUID, Integer> salesMap) {
+        List<Product> merged = deduplicateProducts(retrievedProducts, allProducts);
+
+        if (!isBlank(intent)) {
+            List<Product> strictIntentProducts = merged.stream()
+                    .filter(product -> matchesIntent(product, intent))
+                    .toList();
+            if (strictIntentProducts.isEmpty()) {
+                return List.of();
+            }
+            merged = strictIntentProducts;
+        }
+
+        if (budget != null) {
+            List<Product> withinBudget = merged.stream()
+                    .filter(product -> product.getPrice() != null && product.getPrice().compareTo(budget) <= 0)
+                    .toList();
+            if (!withinBudget.isEmpty()) {
+                merged = withinBudget;
+            }
+        }
+
+        return merged.stream()
+                .sorted((left, right) -> Double.compare(
+                        productScore(mergedUserContext, right, salesMap.getOrDefault(right.getId(), 0), budget),
+                        productScore(mergedUserContext, left, salesMap.getOrDefault(left.getId(), 0), budget)))
+                .limit(12)
+                .toList();
+    }
+
+    private double productScore(String query, Product product, int salesCount, BigDecimal budget) {
+        double relevance = retrievalGatewayService.relevanceScore(query, product);
+        double salesBoost = Math.min(1.0d, salesCount / 10.0d) * 0.25d;
+        double budgetBoost = 0.0d;
+        if (budget != null && product.getPrice() != null) {
+            if (product.getPrice().compareTo(budget) <= 0) {
+                budgetBoost = 0.2d;
+            } else {
+                budgetBoost = -0.15d;
+            }
+        }
+        return relevance + salesBoost + budgetBoost;
+    }
+
+    private List<ChatRecommendationResponse> toRecommendations(List<Product> products,
+                                                                Map<UUID, Integer> salesMap,
+                                                                BigDecimal budget) {
+        return deduplicateRecommendationProducts(products).stream()
+                .limit(MAX_MAIN_RECOMMENDATIONS)
                 .map(product -> new ChatRecommendationResponse(
                         product.getId(),
                         safe(product.getName()),
                         safe(product.getDescription()),
                         safe(product.getImageUrl()),
                         product.getPrice(),
-                        recommendationReason(message, product, sales.getOrDefault(product.getId(), 0), budget),
-                        sales.getOrDefault(product.getId(), 0),
+                        recommendationReason(product, salesMap.getOrDefault(product.getId(), 0), budget),
+                        salesMap.getOrDefault(product.getId(), 0),
                         budget == null || (product.getPrice() != null && product.getPrice().compareTo(budget) <= 0),
                         parseTags(product.getTags())))
                 .toList();
     }
 
-    private List<Product> preferStrictMainRecommendations(String message, List<Product> products) {
-        String intent = detectIntentCategory(message);
-        if (intent == null || allowsCrossCategoryResults(message)) {
-            return products;
-        }
-
-        List<Product> strictMatched = products.stream()
-                .filter(product -> matchesStrictIntent(product, intent))
-                .toList();
-
-        return strictMatched.size() >= Math.min(2, products.size()) ? strictMatched : products;
-    }
-
-        private List<ChatInsightResponse> buildInsights(String detectedIntent,
-                                BigDecimal budget,
-                                List<Product> products,
-                                Map<UUID, Integer> sales,
-                                boolean noProductWithinBudget,
-                                String message) {
-        String topSeller = products.stream()
-                .max(Comparator.comparingInt(product -> sales.getOrDefault(product.getId(), 0)))
-                .map(product -> safe(product.getName()) + " / " + sales.getOrDefault(product.getId(), 0) + " 件成交")
-                .orElse("暂无成交数据");
-
-        return List.of(
-                new ChatInsightResponse("需求类型", detectedIntent),
-            new ChatInsightResponse("核心场景", formatSceneSummary(message)),
-                new ChatInsightResponse("预算范围", formatBudgetSummary(budget)),
-                new ChatInsightResponse("候选商品", products.size() + " 款"),
-                new ChatInsightResponse("筛选状态", noProductWithinBudget ? "预算外替代推荐" : "预算内优先推荐"),
-                new ChatInsightResponse("数据置信分层", buildConfidenceBreakdown(products)),
-                new ChatInsightResponse("热度主推", topSeller));
-    }
-
-    private String buildConfidenceBreakdown(List<Product> products) {
-        long high = products.stream().filter(p -> computeProductConfidenceScore(p) >= 0.75d).count();
-        long medium = products.stream().filter(p -> {
-            double score = computeProductConfidenceScore(p);
-            return score >= 0.50d && score < 0.75d;
-        }).count();
-        long low = Math.max(0L, products.size() - high - medium);
-        return "高 " + high + " / 中 " + medium + " / 低 " + low;
-    }
-
-    private String recommendationReason(String message, Product product, int soldCount, BigDecimal budget) {
+    private String recommendationReason(Product product, int salesCount, BigDecimal budget) {
         List<String> reasons = new ArrayList<>();
-        reasons.add(fallbackReason(message, product));
-
-        String scene = detectScene(message);
-        if (scene != null) {
-            reasons.add("匹配" + formatSceneTag(scene) + "使用场景");
-        }
-
-        String capability = extractCapabilityHighlight(message, product);
-        if (!capability.isBlank()) {
-            reasons.add(capability);
-        }
-
-        String budgetReason = buildBudgetReason(product, budget);
-        if (!budgetReason.isBlank()) {
-            reasons.add(budgetReason);
-        }
-
-        if (soldCount > 0) {
-            reasons.add("历史成交 " + soldCount + " 件，热度稳定");
-        }
-
-        reasons.add("数据置信度：" + confidenceLabel(product));
-
-        return reasons.stream()
-                .filter(item -> item != null && !item.isBlank())
-                .distinct()
-                .collect(Collectors.joining("；"));
-    }
-
-    private String confidenceLabel(Product product) {
-        double score = computeProductConfidenceScore(product);
-        if (score >= 0.75d) {
-            return "高";
-        }
-        if (score >= 0.50d) {
-            return "中";
-        }
-        return "低";
-    }
-
-    private double computeProductConfidenceScore(Product product) {
-        if (product == null) {
-            return 0.0d;
-        }
-
-        double score = 0.35d;
-        String dataSource = safe(product.getDataSource()).toLowerCase(Locale.ROOT);
-
-        if (!dataSource.contains("crawler") && !dataSource.contains("jsonfile")) {
-            score += 0.22d;
-        }
-        if (!safe(product.getSourceProductId()).isBlank()) {
-            score += 0.10d;
-        }
-        if (!isGenericDescription(product.getDescription())) {
-            score += 0.12d;
-        }
-        if (!isGenericDescription(product.getSellingPoints())) {
-            score += 0.10d;
-        }
-        if (!safe(product.getSpecs()).isBlank() && safe(product.getSpecs()).length() >= 10) {
-            score += 0.08d;
-        }
-        if (!safe(product.getPolicy()).isBlank()) {
-            score += 0.05d;
-        }
-        if (isCategoryTagConsistent(product)) {
-            score += 0.08d;
-        } else {
-            score -= 0.10d;
-        }
-        if (isLowQualityCrawlerProduct(product)) {
-            score -= 0.28d;
-        }
-
-        return Math.max(0.0d, Math.min(1.0d, score));
-    }
-
-    private boolean isLowQualityCrawlerProduct(Product product) {
-        String source = safe(product.getDataSource()).toLowerCase(Locale.ROOT);
-        if (!source.contains("crawler") && !source.contains("jsonfile")) {
-            return false;
-        }
-
-        String name = safe(product.getName()).trim();
-        String description = safe(product.getDescription()).trim();
-        String tags = safe(product.getTags()).trim().toLowerCase(Locale.ROOT);
-        boolean missingCore = name.length() < 4 || description.length() < 8;
-        boolean genericDescription = isGenericDescription(description);
-        boolean genericTagsOnly = tags.isBlank() || tags.equals("crawler") || tags.equals("jsonfile") || tags.equals("crawler,jsonfile");
-        return missingCore || genericDescription || genericTagsOnly;
-    }
-
-    private boolean isGenericDescription(String value) {
-        String text = safe(value).toLowerCase(Locale.ROOT).trim();
-        if (text.isBlank() || text.length() < 10) {
-            return true;
-        }
-        return containsAnyKeyword(text, List.of(
-                "时尚百搭",
-                "舒适穿着",
-                "智能便捷生活助手",
-                "母婴护理安心之选",
-                "高性价比日常办公神器",
-                "官方正品",
-                "标准款"));
-    }
-
-    private boolean isCategoryTagConsistent(Product product) {
-        String content = (safe(product.getCategory()) + " " + safe(product.getTags()) + " " + safe(product.getName()))
-                .toLowerCase(Locale.ROOT);
-        if (content.isBlank()) {
-            return false;
-        }
-
-        if (containsAnyKeyword(content, List.of("耳机", "headphone", "buds"))) {
-            return !containsAnyKeyword(content, List.of("母婴", "宠物", "服饰"));
-        }
-        if (containsAnyKeyword(content, List.of("笔记本", "laptop", "电脑"))) {
-            return !containsAnyKeyword(content, List.of("猫粮", "宠物", "纸巾"));
-        }
-        return true;
-    }
-
-    private List<Product> rankProducts(String message, List<Product> products, Map<UUID, Integer> sales, BigDecimal budget) {
-        List<Product> scored = products.stream()
-                .sorted(Comparator.comparingDouble((Product product) -> scoreProduct(message, product, sales, budget)).reversed())
-                .toList();
-
-        List<Product> highConfidence = scored.stream()
-                .filter(product -> computeProductConfidenceScore(product) >= 0.50d)
-                .toList();
-        List<Product> lowConfidence = scored.stream()
-                .filter(product -> computeProductConfidenceScore(product) < 0.50d)
-                .toList();
-
-        List<Product> prioritized = new ArrayList<>(6);
-        for (Product product : highConfidence) {
-            if (prioritized.size() >= 6) {
-                break;
+        if (!isBlank(product.getTags())) {
+            String topTags = parseTags(product.getTags()).stream().limit(2).collect(Collectors.joining(" / "));
+            if (!isBlank(topTags)) {
+                reasons.add("关键词匹配：" + topTags);
             }
-            prioritized.add(product);
-        }
-        for (Product product : lowConfidence) {
-            if (prioritized.size() >= 6) {
-                break;
-            }
-            prioritized.add(product);
-        }
-        return prioritized;
-    }
-
-    private double scoreProduct(String message, Product product, Map<UUID, Integer> sales, BigDecimal budget) {
-        String content = (safe(product.getName()) + " " + safe(product.getDescription()) + " " + safe(product.getTags())).toLowerCase(Locale.ROOT);
-        double score = Math.min(sales.getOrDefault(product.getId(), 0), 20) * 0.08d;
-        String scene = detectScene(message);
-        String intent = detectIntentCategory(message);
-        List<String> preferenceKeywords = extractPreferenceKeywords(message);
-        double semanticRelevance = retrievalGatewayService.relevanceScore(message, product);
-        double confidenceScore = computeProductConfidenceScore(product);
-        boolean strictIntentMatch = intent != null && matchesStrictIntent(product, intent);
-
-        score += semanticRelevance * 5.0d;
-
-        if (scene != null && content.contains(scene)) {
-            score += 1.4d;
-        }
-        if (strictIntentMatch) {
-            score += 2.6d;
-        }
-        if (intent != null) {
-            if (strictIntentMatch) {
-                score += 3.2d;
-            } else if (!allowsCrossCategoryResults(message)) {
-                score -= 4.5d;
-            }
-        }
-        String normalizedMessage = safe(message).toLowerCase(Locale.ROOT).trim();
-        if (!normalizedMessage.isEmpty() && content.contains(normalizedMessage)) {
-            score += 2.2d;
-        }
-        if (messageKeywordScore(message, content) > 0) {
-            score += messageKeywordScore(message, content) * 0.55d;
-        }
-        long preferenceHits = preferenceKeywords.stream().filter(content::contains).count();
-        if (preferenceHits > 0) {
-            score += preferenceHits * 1.15d;
-        }
-        if (fallbackReason(message, product).contains("更适合")) {
-            score += 1.8d;
         }
         if (budget != null && product.getPrice() != null) {
-            if (product.getPrice().compareTo(budget) <= 0) {
-                score += 1.2d;
-                BigDecimal gap = budget.subtract(product.getPrice()).abs();
-                score += Math.max(0.0d, 1.0d - gap.doubleValue() / Math.max(1.0d, budget.doubleValue()));
-            } else {
-                score -= 0.6d;
+            reasons.add(product.getPrice().compareTo(budget) <= 0 ? "预算友好：在你的预算内" : "预算提醒：略高于预算，可作为升级备选");
+        }
+        if (salesCount > 0) {
+            reasons.add("购买热度：历史成交 " + salesCount + " 件");
+        }
+        if (reasons.isEmpty()) {
+            reasons.add("匹配度：与当前需求场景契合");
+        }
+        return String.join("\n", reasons);
+    }
+
+    private List<ChatInsightResponse> buildInsights(String intent,
+                                                    BigDecimal budget,
+                                                    List<AdvisorKnowledgeBaseService.KnowledgeSnippet> snippets,
+                                                    boolean fallback,
+                                                    String detail) {
+        List<ChatInsightResponse> insights = new ArrayList<>();
+        insights.add(new ChatInsightResponse("AI模式", fallback ? "规则兜底" : "实时模型"));
+        insights.add(new ChatInsightResponse(fallback ? "兜底原因" : "模型信息", detail));
+        insights.add(new ChatInsightResponse("需求类型", blankToDefault(intent, "未识别")));
+        insights.add(new ChatInsightResponse("预算范围", budgetSummary(budget)));
+        insights.add(new ChatInsightResponse("知识库命中", String.valueOf(snippets.size())));
+        if (!snippets.isEmpty()) {
+            String topic = snippets.stream()
+                    .limit(3)
+                    .map(item -> safe(item.category()) + ":" + safe(item.title()))
+                    .collect(Collectors.joining(" | "));
+            insights.add(new ChatInsightResponse("知识库主题", topic));
+        }
+        return insights;
+    }
+
+    private BigDecimal resolveBudget(String message, List<String> history) {
+        BigDecimal budget = extractBudget(message);
+        if (budget != null) {
+            return budget;
+        }
+        for (String item : history) {
+            budget = extractBudget(item);
+            if (budget != null) {
+                return budget;
+            }
+        }
+        return null;
+    }
+
+    private BigDecimal extractBudget(String text) {
+        Matcher matcher = STRICT_BUDGET_PATTERN.matcher(safe(text).toLowerCase(Locale.ROOT));
+        while (matcher.find()) {
+            try {
+                BigDecimal value = new BigDecimal(matcher.group(1));
+                if (value.compareTo(BigDecimal.valueOf(30)) >= 0 && value.compareTo(BigDecimal.valueOf(200000)) <= 0) {
+                    return value;
+                }
+            } catch (Exception ignored) {
+                // ignore parse failures and continue scanning
+            }
+        }
+        return null;
+    }
+
+    private String resolveIntent(String message, List<String> history) {
+        String intent = detectIntent(message);
+        if (!isBlank(intent)) {
+            return intent;
+        }
+        for (String item : history) {
+            intent = detectIntent(item);
+            if (!isBlank(intent)) {
+                return intent;
+            }
+        }
+        return "";
+    }
+
+    private String detectIntent(String text) {
+        String normalized = safe(text).toLowerCase(Locale.ROOT);
+        for (Map.Entry<String, List<String>> entry : INTENT_KEYWORDS.entrySet()) {
+            boolean matched = entry.getValue().stream().anyMatch(normalized::contains);
+            if (matched) {
+                return entry.getKey();
+            }
+        }
+        return "";
+    }
+
+    private String inferIntentFromProducts(List<Product> products) {
+        if (products == null || products.isEmpty()) {
+            return "";
+        }
+        for (Product product : products.stream().limit(8).toList()) {
+            String probe = safe(product.getName()) + " " + safe(product.getCategory()) + " " + safe(product.getTags());
+            String detected = detectIntent(probe);
+            if (!isBlank(detected)) {
+                return detected;
+            }
+        }
+        return "";
+    }
+
+    private boolean matchesIntent(Product product, String intent) {
+        List<String> keywords = INTENT_KEYWORDS.getOrDefault(intent, List.of(intent));
+        String content = (safe(product.getName()) + " " + safe(product.getDescription()) + " " + safe(product.getTags()) + " " + safe(product.getCategory()))
+                .toLowerCase(Locale.ROOT);
+        return keywords.stream().anyMatch(content::contains);
+    }
+
+    private String resolveScene(String message, List<String> history) {
+        String scene = detectScene(message);
+        if (!isBlank(scene)) {
+            return scene;
+        }
+        for (String item : history) {
+            scene = detectScene(item);
+            if (!isBlank(scene)) {
+                return scene;
+            }
+        }
+        return "";
+    }
+
+    private String resolveScene(String message, List<String> history, String intent, boolean isCategorySwitch) {
+        String scene = detectScene(message);
+        if (!isBlank(scene)) {
+            return scene;
+        }
+        // 品类切换时只检查当前消息后的历史，避免混淆
+        if (isCategorySwitch && !isBlank(intent)) {
+            return "";
+        }
+        for (String item : history) {
+            scene = detectScene(item);
+            if (!isBlank(scene)) {
+                return scene;
+            }
+        }
+        return "";
+    }
+
+    private String detectScene(String text) {
+        String normalized = safe(text).toLowerCase(Locale.ROOT);
+        if (containsAny(normalized, List.of("通勤", "地铁", "公交", "上班"))) return "通勤";
+        if (containsAny(normalized, List.of("办公", "会议", "码字", "文档"))) return "办公";
+        if (containsAny(normalized, List.of("学习", "学生", "上课", "作业"))) return "学习";
+        if (containsAny(normalized, List.of("运动", "跑步", "健身", "训练"))) return "运动";
+        if (containsAny(normalized, List.of("家用", "家里", "日常", "囤货"))) return "家用";
+        if (containsAny(normalized, List.of("送礼", "礼物", "礼盒"))) return "送礼";
+        if (containsAny(normalized, List.of("出差", "旅行", "外出"))) return "出行";
+        return "";
+    }
+
+    private String resolveFunctionPreference(String message, List<String> history) {
+        return resolveFunctionPreference(message, history, "", false);
+    }
+
+    private String resolveFunctionPreference(String message, List<String> history, String intent, boolean isCategorySwitch) {
+        String current = detectFunctionPreference(message);
+        if (!isBlank(current)) {
+            return current;
+        }
+        // 品类切换时只检查当前消息后的历史，避免混淆
+        if (isCategorySwitch && !isBlank(intent)) {
+            return "";
+        }
+        for (String item : history) {
+            current = detectFunctionPreference(item);
+            if (!isBlank(current)) {
+                return current;
+            }
+        }
+        return "";
+    }
+
+    private String detectFunctionPreference(String text) {
+        String normalized = safe(text).toLowerCase(Locale.ROOT);
+        List<String> keywords = List.of("降噪", "续航", "音质", "静音", "轻薄", "性能", "防水", "透气", "分仓", "人体工学", "快充", "兼容");
+        List<String> hits = keywords.stream().filter(normalized::contains).limit(3).toList();
+        return hits.isEmpty() ? "" : String.join("/", hits);
+    }
+
+    private String resolveAppearancePreference(String message, List<String> history) {
+        return resolveAppearancePreference(message, history, "", false);
+    }
+
+    private String resolveAppearancePreference(String message, List<String> history, String intent, boolean isCategorySwitch) {
+        String current = detectAppearancePreference(message);
+        if (!isBlank(current)) {
+            return current;
+        }
+        // 品类切换时只检查当前消息后的历史，避免混淆
+        if (isCategorySwitch && !isBlank(intent)) {
+            return "";
+        }
+        for (String item : history) {
+            current = detectAppearancePreference(item);
+            if (!isBlank(current)) {
+                return current;
+            }
+        }
+        return "";
+    }
+
+    private String detectAppearancePreference(String text) {
+        String normalized = safe(text).toLowerCase(Locale.ROOT);
+        List<String> keywords = List.of("黑色", "白色", "简约", "商务", "运动风", "复古", "轻量", "小巧", "头戴", "入耳", "圆盘", "方盘", "宽松", "修身");
+        List<String> hits = keywords.stream().filter(normalized::contains).limit(3).toList();
+        return hits.isEmpty() ? "" : String.join("/", hits);
+    }
+
+    private boolean acceptsGenericPreference(String message, List<String> history) {
+        String normalized = safe(message).toLowerCase(Locale.ROOT);
+        if (containsAny(normalized, GENERIC_ACCEPT_WORDS)) {
+            return true;
+        }
+        for (String item : history) {
+            String lowered = safe(item).toLowerCase(Locale.ROOT);
+            if (containsAny(lowered, GENERIC_ACCEPT_WORDS)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String defaultSceneByIntent(String intent) {
+        return switch (safe(intent)) {
+            case "耳机", "手表", "手环", "播放器" -> "通勤";
+            case "笔记本", "键盘", "鼠标" -> "办公";
+            case "手机", "平板", "电子数码" -> "通勤";
+            case "背包", "生活用品", "家居家具", "个护母婴", "母婴玩具" -> "家用";
+            case "服饰", "宠物", "鞋靴", "食品生鲜" -> "日常";
+            default -> "日常";
+        };
+    }
+
+    private String defaultFunctionByIntent(String intent) {
+        return switch (safe(intent)) {
+            case "耳机" -> "降噪/续航";
+            case "笔记本" -> "轻薄/性能平衡";
+            case "手机", "平板" -> "续航/流畅";
+            case "键盘", "鼠标" -> "人体工学/稳定";
+            case "背包" -> "容量/分仓";
+            case "食品生鲜" -> "成分/口感";
+            case "个护美妆" -> "温和/功效";
+            case "家居家具" -> "耐用/收纳";
+            case "电子数码" -> "兼容/稳定";
+            case "手表", "手环" -> "续航/健康监测";
+            case "个护母婴" -> "温和/安全";
+            case "母婴玩具" -> "安全/启蒙";
+            case "宠物" -> "适口性/安全";
+            default -> "性价比/稳定";
+        };
+    }
+
+    private boolean hasAskedDimensionRecently(List<ChatMessage> history, String dimension) {
+        return hasAskedDimensionRecently(history, dimension, "");
+    }
+
+    private boolean hasAskedDimensionRecently(List<ChatMessage> history, String dimension, String intent) {
+        if (history == null || history.isEmpty()) {
+            return false;
+        }
+
+        List<String> dimensionHints = switch (safe(dimension).toLowerCase(Locale.ROOT)) {
+            case "category" -> List.of("品类", "想买", "哪一类", "买什么", "需要什么");
+            case "budget" -> List.of("预算", "价位", "多少钱", "怎么样花", "花多少");
+            case "usage", "scene" -> List.of("场景", "通勤", "办公", "用途", "什么地方", "哪里用");
+            case "function", "feature" -> List.of("功能", "看重", "需求", "偏好", "有什么要求", "什么功能");
+            case "appearance", "style", "color" -> List.of("外观", "颜色", "风格", "外形", "什么色");
+            default -> List.of(dimension);
+        };
+
+        // 检查最近10条AI生成的消息中是否提问过这个维度
+        List<String> recentAssistantMessages = history.stream()
+                .filter(item -> "ASSISTANT".equalsIgnoreCase(safe(item.getRole())))
+                .sorted(Comparator.comparing(ChatMessage::getCreatedAt, Comparator.nullsLast(Comparator.reverseOrder())))
+                .limit(10)
+                .map(item -> safe(item.getContent()).toLowerCase(Locale.ROOT))
+                .toList();
+
+        boolean askedThisDimension = recentAssistantMessages.stream()
+                .anyMatch(content -> dimensionHints.stream().anyMatch(content::contains));
+
+        if (!askedThisDimension) {
+            return false;
+        }
+
+        // 避免连续两轮追问同一维度造成“重复提问”体验。
+        long immediateRepeatCount = recentAssistantMessages.stream()
+            .limit(2)
+            .filter(content -> dimensionHints.stream().anyMatch(content::contains))
+            .count();
+        if (immediateRepeatCount >= 1) {
+            return true;
+        }
+
+        // 只有当用户明确给出了该维度答案，才视为“该维度已问完”。
+        List<String> userResponses = history.stream()
+                .filter(item -> "USER".equalsIgnoreCase(safe(item.getRole())))
+                .sorted(Comparator.comparing(ChatMessage::getCreatedAt, Comparator.nullsLast(Comparator.reverseOrder())))
+            .limit(4)
+                .map(item -> safe(item.getContent()))
+            .filter(content -> content.length() > 1)
+                .toList();
+
+        return userResponses.stream().anyMatch(content -> userAnsweredDimension(content, dimension));
+    }
+
+        private boolean userAnsweredDimension(String content, String dimension) {
+        String normalized = safe(content).toLowerCase(Locale.ROOT);
+        String normalizedDimension = safe(dimension).toLowerCase(Locale.ROOT);
+        return switch (normalizedDimension) {
+            case "budget" -> extractBudget(normalized) != null
+                || containsAny(normalized, List.of("预算", "元", "块", "以内", "不超过", "左右"));
+            case "usage", "scene" -> !isBlank(detectScene(normalized))
+                || containsAny(normalized, List.of("通勤", "办公", "学习", "家用", "出差", "旅行"));
+            case "function", "feature" -> !isBlank(detectFunctionPreference(normalized))
+                || containsAny(normalized, List.of("看重", "需要", "要求", "防水", "续航", "降噪", "轻薄", "性能"));
+            case "appearance", "style", "color" -> !isBlank(detectAppearancePreference(normalized))
+                || containsAny(normalized, List.of("颜色", "外观", "风格", "黑色", "白色", "简约", "商务"));
+            case "category" -> !isBlank(detectIntent(normalized));
+            default -> normalized.length() >= 2;
+        };
+        }
+
+    private int countFulfilledDimensions(BigDecimal budget,
+                                         String scene,
+                                         String functionPreference,
+                                         String appearancePreference,
+                                         String intent) {
+        int count = 0;
+        if (!isBlank(intent)) count++;
+        if (budget != null) count++;
+        if (!isBlank(scene)) count++;
+        if (!isBlank(functionPreference)) count++;
+        if (!isBlank(appearancePreference)) count++;
+        return count;
+    }
+
+    private boolean detectCategorySwitch(String message, List<ChatMessage> history) {
+        if (isBlank(message)) {
+            return false;
+        }
+
+        String normalized = message.toLowerCase(Locale.ROOT);
+        if (CATEGORY_SWITCH_SIGNALS.stream().anyMatch(normalized::contains)) {
+            return true;
+        }
+
+        String currentIntent = detectIntent(message);
+        if (isBlank(currentIntent) || history == null || history.isEmpty()) {
+            return false;
+        }
+
+        String lastUserIntent = history.stream()
+                .filter(item -> "USER".equalsIgnoreCase(safe(item.getRole())))
+                .sorted(Comparator.comparing(ChatMessage::getCreatedAt, Comparator.nullsLast(Comparator.reverseOrder())))
+                .map(item -> detectIntent(item.getContent()))
+                .filter(item -> !isBlank(item))
+                .findFirst()
+                .orElse("");
+
+        return !isBlank(lastUserIntent) && !currentIntent.equals(lastUserIntent);
+    }
+
+    private List<ChatMessage> filterHistoryForNewCategory(String message, List<ChatMessage> history) {
+        String newIntent = detectIntent(message);
+        if (isBlank(newIntent) || history == null || history.isEmpty()) {
+            return history == null ? List.of() : history;
+        }
+
+        int startIndex = -1;
+        for (int i = history.size() - 1; i >= 0; i--) {
+            ChatMessage current = history.get(i);
+            if (!"USER".equalsIgnoreCase(safe(current.getRole()))) {
+                continue;
+            }
+            if (newIntent.equals(detectIntent(current.getContent()))) {
+                startIndex = Math.max(0, i - 2);
+                break;
             }
         }
 
-        // 数据质量分层：优先高置信商品进入前列，低质量爬虫描述降权。
-        score += confidenceScore * 2.4d;
-        if (isLowQualityCrawlerProduct(product)) {
-            score -= 2.2d;
+        if (startIndex < 0) {
+            return List.of();
+        }
+        return history.subList(startIndex, history.size());
+    }
+    private List<String> extractIntentScopedUserMessages(List<ChatMessage> history, String intent, int limit) {
+        if (history == null || history.isEmpty() || isBlank(intent)) {
+            return List.of();
         }
 
+        return history.stream()
+                .sorted(Comparator.comparing(ChatMessage::getCreatedAt, Comparator.nullsLast(Comparator.reverseOrder())))
+                .filter(item -> "USER".equalsIgnoreCase(safe(item.getRole())))
+                .filter(item -> intent.equals(detectIntent(item.getContent())))
+                .map(item -> safe(item.getContent()).trim())
+                .filter(item -> !item.isBlank())
+                .limit(Math.max(1, limit))
+                .toList();
+    }
+
+
+    private boolean shouldUseHistoryForInference(String message, List<String> recentUserMessages) {
+        if (recentUserMessages == null || recentUserMessages.isEmpty()) {
+            return false;
+        }
+
+        if (isFollowUpMessage(message)) {
+            return true;
+        }
+
+        String currentIntent = detectIntent(message);
+        if (isBlank(currentIntent)) {
+            return true;
+        }
+
+        String latestHistoryIntent = detectIntent(recentUserMessages.get(0));
+        if (isBlank(latestHistoryIntent)) {
+            return true;
+        }
+
+        // 用户切换品类时，不继承上一品类预算/场景，防止直接推荐。
+        return currentIntent.equals(latestHistoryIntent);
+    }
+
+    private boolean isFollowUpMessage(String message) {
+        String normalized = safe(message).trim().toLowerCase(Locale.ROOT);
+        if (normalized.isBlank()) {
+            return false;
+        }
+        if (normalized.length() <= 4 && FOLLOW_UP_WORDS.stream().anyMatch(normalized::contains)) {
+            return true;
+        }
+        return FOLLOW_UP_WORDS.stream().anyMatch(normalized::equals);
+    }
+
+    private List<String> resolveMissingDimensions(AdvisorKnowledgeBaseService.ClarificationPlan plan,
+                                                  BigDecimal budget,
+                                                  String scene,
+                                                  String functionPreference,
+                                                  String appearancePreference,
+                                                  String intent) {
+        List<String> required = plan.requiredDimensions() == null || plan.requiredDimensions().isEmpty()
+                ? List.of("budget", "usage", "function")
+                : plan.requiredDimensions();
+
+        List<String> missing = new ArrayList<>();
+        for (String item : required) {
+            String normalized = safe(item).toLowerCase(Locale.ROOT);
+            switch (normalized) {
+                case "budget" -> {
+                    if (budget == null) missing.add("budget");
+                }
+                case "usage", "scene" -> {
+                    if (isBlank(scene)) missing.add("usage");
+                }
+                case "function", "feature" -> {
+                    if (isBlank(functionPreference)) missing.add("function");
+                }
+                case "appearance", "style", "color" -> {
+                    if (isBlank(appearancePreference)) missing.add("appearance");
+                }
+                default -> {
+                    if (isBlank(intent)) missing.add("category");
+                }
+            }
+        }
+        if (isBlank(intent)) {
+            missing.add(0, "category");
+        }
+        return missing.stream().distinct().toList();
+    }
+
+    private List<Product> deduplicateProducts(List<Product> retrievedProducts, List<Product> allProducts) {
+        Map<String, Product> unique = new LinkedHashMap<>();
+        for (Product product : concat(retrievedProducts, allProducts)) {
+            if (product == null) {
+                continue;
+            }
+            String key = canonicalProductKey(product);
+            if (key.isBlank()) {
+                continue;
+            }
+            Product existing = unique.get(key);
+            if (existing == null || shouldReplaceProduct(existing, product)) {
+                unique.put(key, product);
+            }
+        }
+        return List.copyOf(unique.values());
+    }
+
+    private List<Product> deduplicateRecommendationProducts(List<Product> products) {
+        if (products == null || products.isEmpty()) {
+            return List.of();
+        }
+
+        Map<String, Product> unique = new LinkedHashMap<>();
+        for (Product product : products) {
+            if (product == null) {
+                continue;
+            }
+            String key = canonicalProductKey(product);
+            if (key.isBlank() || unique.containsKey(key)) {
+                continue;
+            }
+            unique.put(key, product);
+        }
+        return List.copyOf(unique.values());
+    }
+
+    private String canonicalProductKey(Product product) {
+        String normalizedName = safe(product.getName())
+                .toLowerCase(Locale.ROOT)
+                .replaceAll("[\\s\\-_/，,。·()（）]+", "");
+        String normalizedCategory = safe(product.getCategory())
+                .toLowerCase(Locale.ROOT)
+                .replaceAll("[\\s\\-_/，,。·()（）]+", "");
+        String pricePart = product.getPrice() == null ? "na" : product.getPrice().stripTrailingZeros().toPlainString();
+
+        if (normalizedName.isBlank() && product.getId() != null) {
+            return product.getId().toString();
+        }
+        return normalizedName + "|" + normalizedCategory + "|" + pricePart;
+    }
+
+    private boolean shouldReplaceProduct(Product existing, Product candidate) {
+        int existingScore = productQualityScore(existing);
+        int candidateScore = productQualityScore(candidate);
+        return candidateScore > existingScore;
+    }
+
+    private int productQualityScore(Product product) {
+        int score = 0;
+        if (!isBlank(product.getDescription())) score += 2;
+        if (!isBlank(product.getTags())) score += 1;
+        if (!isBlank(product.getImageUrl())) score += 1;
+        if (product.getPrice() != null) score += 1;
         return score;
     }
 
-    private long messageKeywordScore(String message, String content) {
-        return Pattern.compile("[\\s,，。！？!?:：/]+").splitAsStream(safe(message).toLowerCase(Locale.ROOT))
-                .map(String::trim)
-                .filter(token -> token.length() >= 2)
-                .distinct()
-                .filter(content::contains)
+    private List<Product> concat(List<Product> left, List<Product> right) {
+        List<Product> merged = new ArrayList<>();
+        if (left != null) merged.addAll(left);
+        if (right != null) merged.addAll(right);
+        return merged;
+    }
+
+    private Map<UUID, Integer> aggregateSales(List<OrderItem> soldItems) {
+        return soldItems.stream()
+                .filter(item -> item.getProductId() != null)
+                .collect(Collectors.groupingBy(OrderItem::getProductId, Collectors.summingInt(OrderItem::getQuantity)));
+    }
+
+    private List<String> extractRecentUserMessages(List<ChatMessage> history, int limit) {
+        if (history == null || history.isEmpty()) {
+            return List.of();
+        }
+        return history.stream()
+                .sorted(Comparator.comparing(ChatMessage::getCreatedAt, Comparator.nullsLast(Comparator.reverseOrder())))
+                .filter(item -> "USER".equalsIgnoreCase(safe(item.getRole())))
+                .map(item -> safe(item.getContent()).trim())
+                .filter(item -> !item.isBlank())
+                .limit(Math.max(1, limit))
+                .toList();
+    }
+
+    private List<ChatMessage> extractEffectiveHistory(List<ChatMessage> history, int limit) {
+        if (history == null || history.isEmpty()) {
+            return List.of();
+        }
+        return history.stream()
+                .sorted(Comparator.comparing(ChatMessage::getCreatedAt, Comparator.nullsLast(Comparator.reverseOrder())))
+                .limit(Math.max(1, limit))
+                .toList();
+    }
+
+    private int countRecentClarificationTurns(List<ChatMessage> history) {
+        if (history == null || history.isEmpty()) {
+            return 0;
+        }
+
+        return (int) history.stream()
+                .sorted(Comparator.comparing(ChatMessage::getCreatedAt, Comparator.nullsLast(Comparator.reverseOrder())))
+                .filter(item -> "ASSISTANT".equalsIgnoreCase(safe(item.getRole())))
+                .limit(6)
+                .map(item -> safe(item.getContent()).toLowerCase(Locale.ROOT))
+                .filter(this::isClarificationQuestion)
                 .count();
     }
 
-    private String buildFallbackRecommendation(Product product, String message, int soldCount, BigDecimal budget, boolean primary) {
-        String title = primary ? "1. 主推：" : "2. 备选：";
-        if (!primary && soldCount < 1) {
-            title = "3. 备选：";
+    private boolean isClarificationQuestion(String content) {
+        if (isBlank(content)) {
+            return false;
         }
-        String budgetLine = budget == null || product.getPrice() == null
-                ? "预算判断：未限制预算"
-                : (product.getPrice().compareTo(budget) <= 0 ? "预算判断：在当前预算内" : "预算判断：略高于当前预算");
-        return title + safe(product.getName())
-                + "\n   - 价格：" + formatPrice(product.getPrice()) + " 元"
-                + "\n   - 推荐理由：" + recommendationReason(message, product, soldCount, budget)
-                + "\n   - 适合场景：" + fallbackReason(message, product)
-                + "\n   - " + budgetLine;
+
+        String normalized = content.toLowerCase(Locale.ROOT);
+        boolean isQuestion = normalized.contains("？") || normalized.contains("?");
+        if (!isQuestion) {
+            return false;
+        }
+
+        if (normalized.contains("需求速览") || normalized.contains("推荐清单") || normalized.contains("购买建议")) {
+            return false;
+        }
+
+        return containsAny(normalized, List.of("预算", "场景", "功能", "偏好", "哪一类", "想买", "告诉我", "请补充"));
+    }
+
+    private int calculateAdaptiveMaxTurns(AdvisorKnowledgeBaseService.ClarificationPlan plan,
+                                         List<String> missingDimensions, 
+                                         List<AdvisorKnowledgeBaseService.KnowledgeSnippet> snippets) {
+        // 根据知识库命中情况和缺失维度数量动态调整最大澄清轮数
+        int baseMax = MAX_CLARIFICATION_TURNS;
+        
+        // 如果知识库有很好的匹配，可以减少澄清轮数，快速推荐
+        if (snippets != null && snippets.size() >= 3) {
+            baseMax = Math.max(MIN_CLARIFICATION_TURNS, baseMax - 1);
+        }
+        
+        // 缺失维度较多时，增加澄清的机会（但不超过MAX_CLARIFICATION_TURNS）
+        if (missingDimensions != null && missingDimensions.size() >= 3) {
+            baseMax = Math.min(MAX_CLARIFICATION_TURNS, baseMax);
+        }
+        
+        return baseMax;
+    }
+
+    private String selectBestDimensionToAsk(List<String> missingDimensions,
+                                           AdvisorKnowledgeBaseService.ClarificationPlan plan,
+                                           List<ChatMessage> history,
+                                           String intent) {
+        // 【智能优先级策略】优先级从高到低：
+        // 1. 使用知识库计划的必需维度顺序（品类特定优化）
+        // 2. 跳过已最近被问过的维度
+        // 3. 降级到备用全局优先级
+        
+        List<String> requiredDimensions = plan != null ? plan.requiredDimensions() : List.of();
+        List<String> filteredMissing = missingDimensions.stream()
+                .filter(item -> !hasAskedDimensionRecently(history, item, intent))
+                .toList();
+        
+        if (filteredMissing.isEmpty()) {
+            return "";
+        }
+        
+        // 【第1优先级】按知识库计划的必需维度顺序选择
+        if (!requiredDimensions.isEmpty()) {
+            for (String required : requiredDimensions) {
+                String normalizedReq = required.toLowerCase(Locale.ROOT).trim();
+                String matched = filteredMissing.stream()
+                        .filter(missing -> {
+                            String normalizedMissing = missing.toLowerCase(Locale.ROOT);
+                            return normalizedMissing.contains(normalizedReq) || normalizedReq.contains(normalizedMissing);
+                        })
+                        .findFirst()
+                        .orElse(null);
+                if (matched != null) {
+                    return matched;
+                }
+            }
+        }
+        
+        // 【第2优先级】降级到全局优先级
+        String[] fallbackPriority = {"budget", "scene", "usage", "function", "feature", "appearance", "style", "preference"};
+        for (String priority : fallbackPriority) {
+            String dimension = filteredMissing.stream()
+                    .filter(d -> {
+                        String normalized = d.toLowerCase(Locale.ROOT);
+                        return normalized.contains(priority) || priority.contains(normalized);
+                    })
+                    .findFirst()
+                    .orElse(null);
+            
+            if (dimension != null && !dimension.isBlank()) {
+                return dimension;
+            }
+        }
+        
+        // 【第3优先级】返回第一个缺失维度
+        return filteredMissing.stream().findFirst().orElse("");
+    }
+
+    private String mergeContext(String message, List<String> recentUserMessages) {
+        if (recentUserMessages.isEmpty()) {
+            return safe(message);
+        }
+        return safe(message) + "\n" + String.join("\n", recentUserMessages);
+    }
+
+    private String buildRuleBasedReply(String intent, BigDecimal budget, String scene, List<Product> products) {
+        List<Product> top = products.stream().limit(MAX_MAIN_RECOMMENDATIONS).toList();
+        String recommendation = top.stream()
+                .map(product -> "- " + safe(product.getName()) + "（" + formatPrice(product.getPrice()) + " 元）：" + safe(product.getDescription()))
+                .collect(Collectors.joining("\n"));
+
+        if (recommendation.isBlank()) {
+            return "我先不盲推。你告诉我预算、使用场景和最看重的 1 个点（例如续航/轻薄/容量），我会马上给你精简到 1-3 款。";
+        }
+
+        return "我先按你这轮需求，给你一版更贴近实际的导购建议：\n"
+            + "- 需求类型：" + blankToDefault(intent, "未明确品类") + "\n"
+            + "- 预算范围：" + budgetSummary(budget) + "\n"
+            + "- 使用场景：" + blankToDefault(scene, "未明确") + "\n\n"
+            + "我优先推荐这几款（已尽量避开重复定位）：\n"
+            + recommendation + "\n\n"
+            + "你如果补充一个偏好（品牌/尺寸/颜色/是否要轻量），我可以继续收敛成最终 1-2 款。";
+    }
+
+    private String detectedIntentLabel(String intent, String scene) {
+        String normalizedIntent = blankToDefault(intent, "通用导购");
+        if (isBlank(scene)) {
+            return normalizedIntent;
+        }
+        return normalizedIntent + " / " + scene;
+    }
+
+    private String budgetSummary(BigDecimal budget) {
+        return budget == null ? "未明确" : budget.stripTrailingZeros().toPlainString() + " 元";
+    }
+
+    private String formatPrice(BigDecimal price) {
+        if (price == null) {
+            return "待定";
+        }
+        return price.stripTrailingZeros().toPlainString();
     }
 
     private List<String> parseTags(String tags) {
@@ -659,863 +1293,9 @@ public class AiShoppingAdvisorService {
         return Pattern.compile("[,，]")
                 .splitAsStream(tags)
                 .map(String::trim)
-                .filter(tag -> !tag.isEmpty())
+                .filter(item -> !item.isBlank())
                 .limit(4)
                 .toList();
-    }
-
-    /**
-     * 清洗 AI 回复：剥离推理模型的 &lt;think&gt; 块，规范换行符。
-     * 返回 null 表示回复为空（调用方应路由到 buildFallbackPayload）。
-     */
-    private String normalizeReply(String reply) {
-        if (isBlank(reply)) return null;
-        // 剥离 deepseek-reasoner 等推理模型的 <think>…</think> 思维链块
-        String cleaned = reply.replaceAll("(?s)<think>.*?</think>\\s*", "")
-                              .replace("\r\n", "\n")
-                              .trim();
-        return cleaned.isEmpty() ? null : cleaned;
-    }
-
-    private String fallbackReason(String message, Product product) {
-        String content = (safe(product.getName()) + " " + safe(product.getDescription()) + " " + safe(product.getTags())).toLowerCase(Locale.ROOT);
-        String query = safe(message).toLowerCase(Locale.ROOT);
-        String intent = detectIntentCategory(message);
-        if (intent != null && matchesStrictIntent(product, intent)) {
-            return "更适合你当前明确提出的品类需求";
-        }
-        if ((query.contains("猫") || query.contains("宠物") || query.contains("猫粮") || query.contains("狗粮"))
-                && containsAnyKeyword(content, List.of("宠物", "猫粮", "猫咪", "宠粮", "狗狗", "外出"))) {
-            return "更适合当前宠物补货和外出用品场景";
-        }
-        if (query.contains("降噪") && content.contains("降噪")) {
-            return "更适合通勤和安静聆听场景";
-        }
-        if ((query.contains("办公") || query.contains("笔记本")) && (content.contains("办公") || content.contains("轻薄"))) {
-            return "更适合办公和便携使用场景";
-        }
-        if (query.contains("运动") && (content.contains("运动") || content.contains("健康") || content.contains("手表") || content.contains("手环"))) {
-            return "更适合运动记录和健康监测";
-        }
-        if (query.contains("键盘") && content.contains("键盘")) {
-            return "更适合提升输入效率和桌面体验";
-        }
-        return "和你的需求匹配度较高";
-    }
-
-    private List<Product> filterByIntent(String message, List<Product> products) {
-        String intent = detectIntentCategory(message);
-        if (intent == null) {
-            return products;
-        }
-
-        List<Product> strictMatched = products.stream()
-                .filter(product -> matchesStrictIntent(product, intent))
-                .toList();
-
-        if (!allowsCrossCategoryResults(message) && !strictMatched.isEmpty()) {
-            return strictMatched;
-        }
-
-        List<String> keywords = intentKeywords(intent);
-
-        List<Product> primaryMatched = products.stream()
-                .filter(product -> containsAnyKeyword((safe(product.getName()) + " " + safe(product.getTags())).toLowerCase(Locale.ROOT), keywords))
-                .toList();
-
-        if (primaryMatched.size() >= Math.min(2, products.size())) {
-            return primaryMatched;
-        }
-
-        List<Product> matched = products.stream()
-                .filter(product -> {
-                    String content = (safe(product.getName()) + " " + safe(product.getDescription()) + " " + safe(product.getTags()))
-                            .toLowerCase(Locale.ROOT);
-                    return containsAnyKeyword(content, keywords);
-                })
-                .toList();
-        return matched.isEmpty() ? products : matched;
-    }
-
-    private boolean matchesStrictIntent(Product product, String intent) {
-        String content = (safe(product.getName()) + " " + safe(product.getDescription()) + " " + safe(product.getTags()))
-                .toLowerCase(Locale.ROOT);
-        return switch (intent) {
-            case "耳机" -> containsAnyKeyword(content, List.of("耳机", "headphone", "耳麦", "buds", "freebuds", "xm5", "airpods"))
-                    && !containsAnyKeyword(content, List.of("充电器", "charger", "快充", "氮化镓", "电源"));
-            case INTENT_LIFE_SUPPLIES -> containsAnyKeyword(content, lifeSuppliesKeywords())
-                && !containsAnyKeyword(content, nonLifeSuppliesKeywords());
-            case "笔记本" -> containsAnyKeyword(content, List.of("笔记本", "laptop", "轻薄本", "电脑", "notebook", "ultrabook", "办公本", "游戏本"))
-                && !containsAnyKeyword(content, List.of("充电器", "charger", "快充", "氮化镓", "充电头", "电源", "鼠标", "mouse", "键盘", "keyboard", "显示器", "monitor", "支架", "扩展坞", "dock", "背包", "内胆包"));
-            case "充电器" -> containsAnyKeyword(content, List.of("充电器", "charger", "快充", "氮化镓", "充电头"));
-            case "手表" -> containsAnyKeyword(content, List.of("手表", "watch"));
-            case "手环" -> containsAnyKeyword(content, List.of("手环", "band"));
-            case "键盘" -> containsAnyKeyword(content, List.of("键盘", "keyboard"));
-            case "游戏机" -> containsAnyKeyword(content, List.of("游戏机", "switch", "console", "掌机"));
-            case INTENT_APPAREL -> containsAnyKeyword(content, List.of("卫衣", "t恤", "tee", "hoodie", "sweatshirt", "夹克", "外套", "衬衫", "服饰", "穿搭", "连帽"))
-                    && !containsAnyKeyword(content, List.of("充电器", "charger", "键盘", "keyboard", "猫粮", "宠物", "手表", "手环"));
-            case "宠物" -> containsAnyKeyword(content, List.of("宠物", "猫粮", "猫咪", "狗粮", "狗狗", "宠物包", "猫砂"));
-            default -> containsAnyKeyword(content, intentKeywords(intent));
-        };
-    }
-
-    private boolean allowsCrossCategoryResults(String message) {
-        String text = safe(message).toLowerCase(Locale.ROOT);
-        return text.contains("搭配")
-                || text.contains("配件")
-                || text.contains("套餐")
-                || text.contains("套装")
-                || text.contains("一起买")
-                || text.contains("顺便")
-                || text.contains("组合");
-    }
-
-    private List<Product> mergeProducts(List<Product> primaryProducts, List<Product> fallbackProducts) {
-        return java.util.stream.Stream.concat(primaryProducts.stream(), fallbackProducts.stream())
-                .collect(Collectors.toMap(Product::getId, product -> product, (left, right) -> left, java.util.LinkedHashMap::new))
-                .values()
-                .stream()
-                .toList();
-    }
-
-    private String detectIntentCategory(String message) {
-        String text = safe(message).toLowerCase(Locale.ROOT);
-        if (text.contains("\u8033\u673a") || text.contains("\u964d\u566a") || text.contains("audio") || text.contains("headphone")) {
-            return "\u8033\u673a"; // 耳机
-        }
-        if (containsAnyKeyword(text, lifeSuppliesIntentSignals())) {
-            return INTENT_LIFE_SUPPLIES;
-        }
-        if (text.contains("猫粮") || text.contains("狗粮") || text.contains("宠粮") || text.contains("猫咪") || text.contains("宠物") || text.contains("猫砂") || text.contains("外出包")) {
-            return "宠物";
-        }
-        if (text.contains("笔记本")
-                || text.contains("电脑")
-                || text.contains("laptop")
-                || text.contains("notebook")
-                || text.contains("ultrabook")
-                || text.contains("轻薄本")
-                || text.contains("办公本")
-                || text.contains("游戏本")
-                || text.contains("macbook")) {
-            return "笔记本";
-        }
-        if (text.contains("充电器") || text.contains("充电头") || text.contains("快充") || text.contains("charger")) {
-            return "充电器";
-        }
-        if (text.contains("手表") || text.contains("watch")) {
-            return "手表";
-        }
-        if (text.contains("手环") || text.contains("band")) {
-            return "手环";
-        }
-        if (text.contains("键盘") || text.contains("keyboard")) {
-            return "键盘";
-        }
-        if (text.contains("游戏机") || text.contains("switch") || text.contains("console")) {
-            return "游戏机";
-        }
-        if (containsAnyKeyword(text, List.of("卫衣", "t恤", "t-shirt", "tee", "夹克", "外套", "衬衫", "服装", "穿搭", "连帽", "hoodie", "sweatshirt"))) {
-            return INTENT_APPAREL;
-        }
-        return null;
-    }
-
-    private List<String> intentKeywords(String intent) {
-        return switch (intent) {
-            case "耳机" -> List.of("耳机", "headphone", "freebuds", "xm5", "buds");
-            case INTENT_LIFE_SUPPLIES -> lifeSuppliesKeywords();
-            case INTENT_APPAREL -> List.of("卫衣", "t恤", "tee", "hoodie", "sweatshirt", "夹克", "外套", "衬衫", "服饰", "穿搭", "连帽");
-            case "宠物" -> List.of("宠物", "猫粮", "猫咪", "宠粮", "狗粮", "狗狗", "外出", "宠物包", "猫砂");
-            case "笔记本" -> List.of("笔记本", "laptop", "电脑", "轻薄本", "notebook", "ultrabook", "办公本", "游戏本");
-            case "充电器" -> List.of("充电器", "charger", "快充", "氮化镓", "充电头");
-            case "手表" -> List.of("手表", "watch");
-            case "手环" -> List.of("手环", "band");
-            case "键盘" -> List.of("键盘", "keyboard");
-            case "游戏机" -> List.of("游戏机", "console", "switch");
-            default -> List.of(intent.toLowerCase(Locale.ROOT));
-        };
-    }
-
-    private boolean containsAnyKeyword(String content, List<String> keywords) {
-        return keywords.stream().anyMatch(content::contains);
-    }
-
-    private String detectScene(String message) {
-        String text = safe(message).toLowerCase(Locale.ROOT);
-        if (text.contains("通勤") || text.contains("地铁")) {
-            return "通勤";
-        }
-        if (text.contains("会议") || text.contains("视频") || text.contains("开会")) {
-            return "会议";
-        }
-        if (text.contains("办公") || text.contains("桌面") || text.contains("写方案")) {
-            return "办公";
-        }
-        if (text.contains("学习") || text.contains("上课") || text.contains("学生") || text.contains("宿舍学习")) {
-            return "学习";
-        }
-        if (text.contains("游戏") || text.contains("打游戏") || text.contains("电竞")) {
-            return "游戏";
-        }
-        if (text.contains("跑步") || text.contains("健身") || text.contains("训练")) {
-            return "运动";
-        }
-        if (text.contains("宿舍") || text.contains("娱乐") || text.contains("影音")) {
-            return "娱乐";
-        }
-        if (text.contains("出差") || text.contains("差旅") || text.contains("移动")) {
-            return "差旅";
-        }
-        if (text.contains("猫") || text.contains("宠物") || text.contains("喂养") || text.contains("看诊")) {
-            return "宠物";
-        }
-        return null;
-    }
-
-    private String formatSceneSummary(String message) {
-        String scene = detectScene(message);
-        if (scene == null) {
-            return "未明确场景，按综合需求推荐";
-        }
-        return switch (scene) {
-            case "通勤" -> "地铁通勤 / 日常外出";
-            case "会议" -> "视频会议 / 通话协作";
-            case "办公" -> "桌面办公 / 高效输入";
-            case "学习" -> "学生学习 / 上课携带 / 资料整理";
-            case "游戏" -> "游戏娱乐 / 性能优先";
-            case "运动" -> "跑步训练 / 健康监测";
-            case "娱乐" -> "宿舍娱乐 / 家庭影音";
-            case "差旅" -> "差旅携带 / 移动办公";
-            case "宠物" -> "宠物喂养 / 日常补货 / 外出看诊";
-            default -> scene;
-        };
-    }
-
-    private String formatIntentLabel(String intent, String message) {
-        String base = formatIntent(intent);
-        String scene = formatSceneSummary(message);
-        if (scene.startsWith("未明确场景")) {
-            return base;
-        }
-        return base + " / " + scene;
-    }
-
-    private Mono<AdvisorExecution> generateRealtimeAdvice(UUID userId, String message) {
-        return Mono.fromCallable(() -> runRealtimeAdviceWithRetries(userId, message))
-                .subscribeOn(Schedulers.boundedElastic());
-    }
-
-    private AdvisorExecution runRealtimeAdviceWithRetries(UUID userId, String message) {
-        AiProperties.Provider provider = currentProvider();
-        int maxAttempts = resolveRealtimeAttempts(provider);
-        RuntimeException lastError = null;
-
-        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
-            if (attempt > 1) {
-                invalidateAiCaches();
-                sleepBeforeRetry(attempt);
-            }
-
-            try {
-                ShoppingAdvisorAiService aiService = getOrCreateShoppingAdvisorAiService();
-                if (aiService == null) {
-                    throw new IllegalStateException(getModelUnavailableReason());
-                }
-                return runAdvisorWithTools(userId, message, aiService);
-            } catch (RuntimeException error) {
-                lastError = error;
-                String summary = summarizeError(error);
-                boolean retryable = shouldRetryRealtimeAdvice(error, attempt, maxAttempts);
-                log.warn("AI realtime attempt {}/{} failed on provider {}: {}", attempt, maxAttempts, currentProviderName(), summary);
-                if (!retryable) {
-                    throw error;
-                }
-            }
-        }
-
-        invalidateAiCaches();
-        throw lastError == null ? new IllegalStateException("AI_REALTIME_RETRY_EXHAUSTED") : lastError;
-    }
-
-    private int resolveRealtimeAttempts(AiProperties.Provider provider) {
-        int providerRetries = resolveMaxRetries(provider);
-        int attempts = providerRetries + 1;
-        return Math.max(MIN_REALTIME_ATTEMPTS, Math.min(MAX_REALTIME_ATTEMPTS, attempts));
-    }
-
-    private boolean shouldRetryRealtimeAdvice(RuntimeException error, int attempt, int maxAttempts) {
-        if (attempt >= maxAttempts) {
-            return false;
-        }
-
-        String summary = summarizeError(error).toLowerCase(Locale.ROOT);
-        if (summary.contains("insufficient balance")
-                || summary.contains("invalid api key")
-                || summary.contains("incorrect api key")
-                || summary.contains("model does not exist")
-                || summary.contains("ai_api_key_missing")
-                || summary.contains("ai_model_name_missing")) {
-            return false;
-        }
-
-        return summary.contains("timeout")
-                || summary.contains("timed_out")
-                || summary.contains("interrupted")
-                || summary.contains("connection reset")
-                || summary.contains("connection refused")
-                || summary.contains("read timed out")
-                || summary.contains("temporarily unavailable")
-                || summary.contains("rate limit")
-                || summary.contains("too many requests")
-                || summary.contains("server error")
-                || summary.contains("502")
-                || summary.contains("503")
-                || summary.contains("504")
-                || summary.contains("unexpected end")
-                || summary.contains("ssl")
-                || summary.contains("network")
-                || summary.contains("io exception")
-                || summary.contains("interruptedioexception")
-                || summary.contains("http2");
-    }
-
-    private void sleepBeforeRetry(int attempt) {
-        long delayMillis = Math.min(1800L, 350L * attempt);
-        try {
-            Thread.sleep(delayMillis);
-        } catch (InterruptedException interruptedException) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("AI_RETRY_INTERRUPTED", interruptedException);
-        }
-    }
-
-    private void invalidateAiCaches() {
-        chatLanguageModel = null;
-        shoppingAdvisorAiService = null;
-        directShoppingAdvisorAiService = null;
-    }
-
-    private AdvisorExecution runAdvisorWithTools(UUID userId, String message, ShoppingAdvisorAiService aiService) {
-        advisorToolContext.begin(userId, message);
-        try {
-            String reply = aiService.advise(buildToolAdvisorInput(userId, message));
-            AdvisorToolContext.AdvisorToolSnapshot snapshot = advisorToolContext.finish();
-            return new AdvisorExecution(reply, snapshot);
-        } catch (RuntimeException error) {
-            advisorToolContext.clear();
-            throw error;
-        }
-    }
-
-    private String buildToolAdvisorInput(UUID userId, String message) {
-        BigDecimal budget = extractBudget(message);
-        List<ChatMessage> history = chatMessageRepository.findByUserId(userId)
-                .collectList()
-                .blockOptional(Duration.ofSeconds(3))
-                .orElse(List.of());
-        return "用户原始问题：" + message + "\n"
-                + "结构化需求摘要：\n" + buildDemandSummary(message, budget, history) + "\n"
-                + "工具调用提示：\n" + buildToolRoutingHints(message) + "\n"
-                + "请先基于上述需求理解用户，再调用工具检索并给出推荐。";
-    }
-
-    private String buildToolRoutingHints(String message) {
-        String text = safe(message).toLowerCase(Locale.ROOT);
-        List<String> hints = new ArrayList<>();
-        hints.add("商品推荐前至少调用一次商品检索工具。");
-
-        if (containsAnyKeyword(text, List.of("天气", "下雨", "气温", "温度", "冷不冷", "热不热"))) {
-            hints.add("如果涉及天气，请优先调用 getWeatherSummary(city)。");
-        }
-        if (containsAnyKeyword(text, List.of("日期", "哪天", "周末", "周六", "周日", "出差", "出行", "节假日", "安排"))) {
-            hints.add("如果涉及日期、节假日或出行安排，请优先调用 getDateTravelContext(dateText, city)。");
-        }
-        if (containsAnyKeyword(text, List.of("怎么穿", "穿搭", "穿什么", "鞋", "衣服", "外套", "通勤穿搭", "运动风"))) {
-            hints.add("如果涉及穿搭、鞋服或出行着装，请优先调用 getOutfitAdvice(city, scene, stylePreference)。");
-        }
-
-        return String.join("\n", hints);
-    }
-
-    private String buildDemandSummary(String message, BigDecimal budget, List<ChatMessage> history) {
-        String intent = formatIntentLabel(detectIntentCategory(message), message);
-        String scene = formatSceneSummary(message);
-        String preferences = formatPreferenceSummary(message);
-        String constraints = formatConstraintSummary(message, budget);
-        String historySummary = history.stream()
-                .sorted(Comparator.comparing(ChatMessage::getCreatedAt))
-                .skip(Math.max(0, history.size() - 4L))
-                .map(item -> ("USER".equals(item.getRole()) ? "用户" : "助手") + "：" + safe(item.getContent()))
-                .collect(Collectors.joining(" | "));
-
-        return "- 品类/需求类型：" + intent + "\n"
-                + "- 使用场景：" + scene + "\n"
-                + "- 预算：" + formatBudgetSummary(budget) + "\n"
-                + "- 偏好信号：" + preferences + "\n"
-                + "- 约束与风险：" + constraints + "\n"
-                + "- 最近上下文：" + (historySummary.isBlank() ? "暂无" : historySummary);
-    }
-
-    private List<String> extractPreferenceKeywords(String message) {
-        String text = safe(message).toLowerCase(Locale.ROOT);
-        List<String> preferences = new ArrayList<>();
-        if (containsAnyKeyword(text, List.of("轻便", "便携", "小巧", "轻薄", "方便带"))) preferences.add("轻薄");
-        if (containsAnyKeyword(text, List.of("续航", "耐用", "电池", "待机"))) preferences.add("续航");
-        if (containsAnyKeyword(text, List.of("降噪", "安静", "隔音"))) preferences.add("降噪");
-        if (containsAnyKeyword(text, List.of("音质", "听歌", "声音"))) preferences.add("音质");
-        if (containsAnyKeyword(text, List.of("通话", "开会", "会议", "麦克风"))) preferences.add("通话");
-        if (containsAnyKeyword(text, List.of("性能", "流畅", "游戏", "剪辑", "渲染"))) preferences.add("性能");
-        if (containsAnyKeyword(text, List.of("办公", "文档", "表格", "码字", "学习"))) preferences.add("办公");
-        if (containsAnyKeyword(text, List.of("舒适", "佩戴", "不夹头"))) preferences.add("舒适");
-        return preferences.stream().distinct().toList();
-    }
-
-    private String formatPreferenceSummary(String message) {
-        List<String> preferences = extractPreferenceKeywords(message);
-        return preferences.isEmpty() ? "未明确偏好，按综合体验理解" : String.join(" / ", preferences);
-    }
-
-    private String formatConstraintSummary(String message, BigDecimal budget) {
-        List<String> constraints = new ArrayList<>();
-        if (budget != null) {
-            constraints.add("优先预算内");
-        }
-        String text = safe(message).toLowerCase(Locale.ROOT);
-        if (text.contains("不要") || text.contains("别") || text.contains("不能")) {
-            constraints.add("存在明确排斥条件，推荐时避免反向理解");
-        }
-        if (text.contains("性价比") || text.contains("划算")) {
-            constraints.add("价格敏感");
-        }
-        if (text.contains("专业") || text.contains("高端") || text.contains("旗舰")) {
-            constraints.add("体验优先");
-        }
-        return constraints.isEmpty() ? "未提到明显限制" : String.join(" / ", constraints);
-    }
-
-    private Mono<String> generateDirectRealtimeAdvice(String message,
-                                                      List<Product> products,
-                                                      List<ChatMessage> history,
-                                                      List<OrderItem> soldItems,
-                                                      BigDecimal budget,
-                                                      boolean noProductWithinBudget) {
-        return Mono.fromCallable(() -> runDirectRealtimeAdvice(message, products, history, soldItems, budget, noProductWithinBudget))
-                .subscribeOn(Schedulers.boundedElastic());
-    }
-
-    private String runDirectRealtimeAdvice(String message,
-                                           List<Product> products,
-                                           List<ChatMessage> history,
-                                           List<OrderItem> soldItems,
-                                           BigDecimal budget,
-                                           boolean noProductWithinBudget) {
-        DirectShoppingAdvisorAiService directAiService = getOrCreateDirectShoppingAdvisorAiService();
-        if (directAiService == null) {
-            throw new IllegalStateException(getModelUnavailableReason());
-        }
-
-        String prompt = buildPrompt(message, products, history, soldItems, budget, noProductWithinBudget);
-        return directAiService.advise(prompt);
-    }
-
-    private ChatAdvicePayload buildSuccessPayload(String reply,
-                                                 List<ChatRecommendationResponse> recommendations,
-                                                 List<ChatRecommendationResponse> relatedRecommendations,
-                                                 List<ChatInsightResponse> insights,
-                                                 String detectedIntent,
-                                                 String budgetSummary) {
-        recordSuccess();
-        String alignedReply = alignReplyWithRecommendations(reply, recommendations, detectedIntent, budgetSummary);
-        return new ChatAdvicePayload(
-            alignedReply,
-                recommendations,
-                relatedRecommendations,
-                enrichInsights(insights, false, activeModelLabel()),
-                detectedIntent,
-                budgetSummary,
-                false);
-    }
-
-    private ChatAdvicePayload buildFallbackPayload(String reply,
-                                                  List<ChatRecommendationResponse> recommendations,
-                                                  List<ChatRecommendationResponse> relatedRecommendations,
-                                                  List<ChatInsightResponse> insights,
-                                                  String detectedIntent,
-                                                  String budgetSummary,
-                                                  String fallbackReason) {
-        recordFallback(fallbackReason);
-        String enhancedReply = appendFallbackDiagnostics(reply, fallbackReason);
-        return new ChatAdvicePayload(
-            enhancedReply,
-                recommendations,
-                relatedRecommendations,
-                enrichInsights(insights, true, fallbackReason),
-                detectedIntent,
-                budgetSummary,
-                true);
-    }
-
-    private List<ChatInsightResponse> enrichInsights(List<ChatInsightResponse> insights, boolean fallback, String detail) {
-        List<ChatInsightResponse> enriched = new ArrayList<>();
-        enriched.add(new ChatInsightResponse("AI模式", fallback ? "规则兜底" : "实时模型"));
-        enriched.add(new ChatInsightResponse(fallback ? "兜底原因" : "模型信息", detail));
-        if (fallback) {
-            List<String> solutions = resolveFallbackSolutions(detail);
-            enriched.add(new ChatInsightResponse("恢复建议", String.join("；", solutions)));
-        }
-        enriched.addAll(insights);
-        return List.copyOf(enriched);
-    }
-
-    private String appendFallbackDiagnostics(String reply, String fallbackReason) {
-        List<String> solutions = resolveFallbackSolutions(fallbackReason);
-        String reasonLine = "兜底原因：" + safe(fallbackReason);
-        String solutionLine = "建议处理：" + String.join("；", solutions);
-        return safe(reply) + "\n\n" + reasonLine + "\n" + solutionLine;
-    }
-
-    private List<String> resolveFallbackSolutions(String reason) {
-        String normalized = safe(reason).toLowerCase(Locale.ROOT);
-        if (normalized.contains("timeout") || normalized.contains("timed_out") || normalized.contains("interrupted") || normalized.contains("read timed out")) {
-            return List.of(
-                    "将模型超时时间提升到 120-180 秒",
-                    "检查代理与网络稳定性，避免 TLS/网关抖动",
-                    "降低提示词长度并减少上下文冗余");
-        }
-        if (normalized.contains("insufficient balance")) {
-            return List.of(
-                    "补充模型服务余额",
-                    "切换到可用的备用模型",
-                    "增加余额不足的监控告警");
-        }
-        if (normalized.contains("invalid api key") || normalized.contains("incorrect api key") || normalized.contains("ai_api_key_missing")) {
-            return List.of(
-                    "检查并更新 API Key",
-                    "确认运行环境已注入密钥",
-                    "重启服务使新配置生效");
-        }
-        if (normalized.contains("model does not exist") || normalized.contains("ai_model_name_missing")) {
-            return List.of(
-                    "确认模型名是否可用",
-                    "切换到已验证可用模型",
-                    "保存配置后重启服务并复测");
-        }
-        if (normalized.contains("connection refused") || normalized.contains("network") || normalized.contains("ssl") || normalized.contains("http2")) {
-            return List.of(
-                    "检查出口网络和代理配置",
-                    "确认模型服务地址可达",
-                    "必要时改用更稳定线路或供应商");
-        }
-        if (normalized.contains("no_ranked_products") || normalized.contains("no_products")) {
-            return List.of(
-                    "补充商品数据并提高类目覆盖",
-                    "检查检索关键词和类目映射",
-                    "确认向量索引已刷新完成");
-        }
-        return List.of(
-                "检查 AI 服务可用性和响应时延",
-                "查看后端日志定位失败环节",
-                "按错误码重试并观察是否可恢复");
-    }
-
-    private String alignReplyWithRecommendations(String reply,
-                                                 List<ChatRecommendationResponse> recommendations,
-                                                 String detectedIntent,
-                                                 String budgetSummary) {
-        if (recommendations == null || recommendations.isEmpty()) {
-            return safe(reply);
-        }
-        String normalizedReply = safe(reply).trim();
-        if (normalizedReply.isBlank()) {
-            normalizedReply = "需求速览：已根据你的场景和预算完成检索与排序。";
-        }
-
-        String alignedSection = buildCardAlignedRecommendationSection(recommendations);
-        return normalizedReply
-                + "\n\n商品卡一致推荐（最终候选）：\n"
-                + "- 需求类型：" + safe(detectedIntent) + "\n"
-                + "- 预算范围：" + safe(budgetSummary) + "\n"
-                + alignedSection
-                + "\n\n补充建议：若你希望更省预算、指定品牌、或更看重某一指标（如续航/舒适/性能），我可在这 3 款内继续精排。";
-    }
-
-    private String extractSummarySection(String reply) {
-        String normalized = safe(reply).replace("\r\n", "\n").trim();
-        if (normalized.isBlank()) {
-            return "用户偏好信息较少，已按当前需求做稳妥推荐";
-        }
-        String oneLine = normalized.replaceAll("[\\n\\t]+", " ").replaceAll("\\s+", " ").trim();
-        if (oneLine.length() > 90) {
-            return oneLine.substring(0, 90) + "...";
-        }
-        return oneLine;
-    }
-
-    private String buildCardAlignedRecommendationSection(List<ChatRecommendationResponse> recommendations) {
-        String lines = recommendations.stream()
-                .limit(MAX_RECOMMENDATIONS)
-                .map(item -> "- " + safe(item.name())
-                        + "（" + formatPrice(item.price()) + "元，"
-                        + (item.withinBudget() ? "预算内" : "预算外")
-                        + "）\n"
-                        + "  理由：" + safe(item.reason())
-                        + (item.tags() == null || item.tags().isEmpty() ? "" : "\n  标签：" + String.join(" / ", item.tags()))
-                        + "\n  热度：" + Math.max(0, item.salesCount()) + " 件成交")
-                .collect(Collectors.joining("\n"));
-        return "推荐清单（与商品卡严格一致）：\n" + lines;
-    }
-
-    private String buildBudgetReason(Product product, BigDecimal budget) {
-        if (budget == null || product.getPrice() == null) {
-            return "";
-        }
-        if (product.getPrice().compareTo(budget) <= 0) {
-            BigDecimal margin = budget.subtract(product.getPrice()).max(BigDecimal.ZERO);
-            return "在预算内，预算余量约 " + formatPrice(margin) + " 元";
-        }
-        BigDecimal exceed = product.getPrice().subtract(budget).abs();
-        return "超预算约 " + formatPrice(exceed) + " 元，但综合匹配度较高";
-    }
-
-    private String formatSceneTag(String scene) {
-        return switch (scene) {
-            case "通勤" -> "通勤外出";
-            case "会议" -> "会议通话";
-            case "办公" -> "办公学习";
-            case "学习" -> "学习携带";
-            case "游戏" -> "游戏娱乐";
-            case "运动" -> "运动健康";
-            case "娱乐" -> "影音娱乐";
-            case "差旅" -> "差旅移动";
-            case "宠物" -> "宠物喂养";
-            default -> scene;
-        };
-    }
-
-    private String extractCapabilityHighlight(String message, Product product) {
-        String text = safe(message).toLowerCase(Locale.ROOT);
-        String content = (safe(product.getName()) + " " + safe(product.getDescription()) + " "
-                + safe(product.getSellingPoints()) + " " + safe(product.getTags())).toLowerCase(Locale.ROOT);
-
-        if (containsAnyKeyword(text, List.of("降噪", "安静", "隔音")) && containsAnyKeyword(content, List.of("降噪", "主动降噪", "anc"))) {
-            return "降噪能力与需求一致";
-        }
-        if (containsAnyKeyword(text, List.of("续航", "待机", "电池")) && containsAnyKeyword(content, List.of("续航", "电池", "待机", "长续航"))) {
-            return "续航表现更贴合你的关注点";
-        }
-        if (containsAnyKeyword(text, List.of("轻便", "便携", "轻薄")) && containsAnyKeyword(content, List.of("轻", "薄", "便携", "小巧"))) {
-            return "便携和日常携带体验更友好";
-        }
-        if (containsAnyKeyword(text, List.of("性能", "流畅", "游戏", "剪辑")) && containsAnyKeyword(content, List.of("性能", "高刷", "旗舰", "流畅", "游戏"))) {
-            return "性能与流畅度更符合高负载需求";
-        }
-        return "";
-    }
-
-    private List<ChatInsightResponse> appendToolInsights(List<ChatInsightResponse> insights,
-                                                         AdvisorToolContext.AdvisorToolSnapshot snapshot) {
-        List<ChatInsightResponse> enriched = new ArrayList<>(insights);
-        enriched.add(new ChatInsightResponse("Tool命中商品", String.valueOf(snapshot.products().size())));
-        enriched.add(new ChatInsightResponse("Tool调用轨迹", snapshot.traces().isEmpty() ? "无" : String.join(" | ", snapshot.traces())));
-        return List.copyOf(enriched);
-    }
-
-    private List<ChatInsightResponse> appendDirectAiRecoveryInsights(List<ChatInsightResponse> insights, String reason) {
-        List<ChatInsightResponse> enriched = new ArrayList<>(insights);
-        enriched.add(new ChatInsightResponse("AI恢复链路", "Tools 协议失败后自动切换到直连模型生成"));
-        enriched.add(new ChatInsightResponse("Tools失败原因", reason));
-        return List.copyOf(enriched);
-    }
-
-    private List<ChatInsightResponse> appendDirectAiBypassInsights(List<ChatInsightResponse> insights, String modelName) {
-        List<ChatInsightResponse> enriched = new ArrayList<>(insights);
-        enriched.add(new ChatInsightResponse("AI链路", "当前模型跳过 Tools，直接走实时生成"));
-        enriched.add(new ChatInsightResponse("模型信息", currentProviderName() + " / " + modelName));
-        return List.copyOf(enriched);
-    }
-
-    private void recordSuccess() {
-        consecutiveFallbacks.set(0);
-        runtimeStatusRef.set(new AiRuntimeStatus(currentProviderName(), activeModelName(), false, "OK", Instant.now(), 0));
-    }
-
-    private void recordFallback(String reason) {
-        int fallbackCount = consecutiveFallbacks.incrementAndGet();
-        runtimeStatusRef.set(new AiRuntimeStatus(currentProviderName(), activeModelName(), true, reason, Instant.now(), fallbackCount));
-        log.warn("AI advisor fallback triggered: {}", reason);
-    }
-
-    private String getModelUnavailableReason() {
-        AiProperties.Provider provider = currentProvider();
-        if (provider == null) {
-            return "AI_PROVIDER_NOT_SUPPORTED";
-        }
-        if (isBlank(provider.getApiKey())) {
-            return "AI_API_KEY_MISSING";
-        }
-        if (isBlank(provider.getBaseUrl())) {
-            return "AI_BASE_URL_MISSING";
-        }
-        if (isBlank(resolveModelName(provider))) {
-            return "AI_MODEL_NAME_MISSING";
-        }
-        return "AI_MODEL_INIT_FAILED";
-    }
-
-    private String previewConfigurationReason() {
-        AiProperties.Provider provider = currentProvider();
-        if (provider == null) {
-            return "AI_PROVIDER_NOT_SUPPORTED";
-        }
-        if (isBlank(provider.getApiKey())) {
-            return "AI_API_KEY_MISSING";
-        }
-        if (isBlank(provider.getBaseUrl())) {
-            return "AI_BASE_URL_MISSING";
-        }
-        if (isBlank(resolveModelName(provider))) {
-            return "AI_MODEL_NAME_MISSING";
-        }
-        return "READY";
-    }
-
-    private String summarizeError(Throwable error) {
-        Throwable rootCause = error;
-        while (rootCause != null && rootCause.getCause() != null && rootCause.getCause() != rootCause) {
-            rootCause = rootCause.getCause();
-        }
-
-        if (rootCause instanceof java.io.InterruptedIOException) {
-            return "AI_REQUEST_INTERRUPTED_OR_TIMED_OUT";
-        }
-
-        String fullMessage = safe(error == null ? "" : error.toString()).toLowerCase(Locale.ROOT);
-        if (fullMessage.contains("insufficient balance")) {
-            return "AI_PROVIDER_INSUFFICIENT_BALANCE";
-        }
-
-        String message = error == null ? "UNKNOWN" : safe(error.getMessage()).replace('\n', ' ').replace('\r', ' ').trim();
-        if (message.isEmpty()) {
-            message = error == null ? "UNKNOWN" : error.getClass().getSimpleName();
-        }
-        String summary = error == null ? "AI_MODEL_CALL_FAILED" : error.getClass().getSimpleName() + ": " + message;
-        return summary.length() > 180 ? summary.substring(0, 180) : summary;
-    }
-
-    private AiProperties.Provider currentProvider() {
-        String providerName = currentProviderName().toLowerCase(Locale.ROOT);
-        return switch (providerName) {
-            case "chatgpt", "openai", "openai-compatible" -> aiProperties.getChatgpt();
-            case "siliconflow" -> aiProperties.getSiliconflow();
-            case "deepseek" -> aiProperties.getDeepseek();
-            default -> null;
-        };
-    }
-
-    private String currentProviderName() {
-        return isBlank(aiProperties.getProvider()) ? "deepseek" : aiProperties.getProvider();
-    }
-
-    private String activeModelName() {
-        AiProperties.Provider provider = currentProvider();
-        String modelName = resolveModelName(provider);
-        if (provider == null || isBlank(modelName)) {
-            return "unknown";
-        }
-        return modelName;
-    }
-
-    private String activeModelLabel() {
-        return currentProviderName() + " / " + activeModelName();
-    }
-
-    private boolean supportsToolCalling() {
-        String provider = currentProviderName().toLowerCase(Locale.ROOT);
-        String modelName = activeModelName().toLowerCase(Locale.ROOT);
-        // DeepSeek 推理模型不支持 Function Calling（回复在 reasoning_content 而非 content）
-        if ("deepseek".equals(provider) && modelName.contains("reasoner")) {
-            log.warn("Model {} does not support tool calling, switching to direct path", modelName);
-            return false;
-        }
-        // o1/o3 系列也不支持 Function Calling
-        if (("openai".equals(provider) || "chatgpt".equals(provider))
-                && (modelName.startsWith("o1") || modelName.startsWith("o3"))) {
-            return false;
-        }
-        return true;
-    }
-
-    private ChatLanguageModel getOrCreateModel() {
-        ChatLanguageModel cached = chatLanguageModel;
-        if (cached != null) {
-            return cached;
-        }
-
-        synchronized (this) {
-            if (chatLanguageModel != null) {
-                return chatLanguageModel;
-            }
-
-            AiProperties.Provider provider = currentProvider();
-            if (provider == null || isBlank(provider.getApiKey()) || isBlank(provider.getBaseUrl())) {
-                return null;
-            }
-
-            if ("deepseek".equals(currentProviderName().toLowerCase(Locale.ROOT))) {
-                chatLanguageModel = Http11OpenAiChatModel.builder()
-                        .apiKey(provider.getApiKey())
-                        .baseUrl(provider.getBaseUrl())
-                        .modelName(resolveModelName(provider))
-                        .timeout(resolveTimeout(provider))
-                        .maxRetries(resolveMaxRetries(provider))
-                        .logRequests(provider.isLogRequests())
-                        .logResponses(provider.isLogResponses())
-                        .temperature(0.35)
-                        .build();
-            } else {
-                chatLanguageModel = OpenAiChatModel.builder()
-                        .apiKey(provider.getApiKey())
-                        .baseUrl(provider.getBaseUrl())
-                        .modelName(resolveModelName(provider))
-                        .timeout(resolveTimeout(provider))
-                        .maxRetries(resolveMaxRetries(provider))
-                        .logRequests(provider.isLogRequests())
-                        .logResponses(provider.isLogResponses())
-                        .temperature(0.35)
-                        .build();
-            }
-            return chatLanguageModel;
-        }
-    }
-
-    private Duration resolveTimeout(AiProperties.Provider provider) {
-        if (provider == null || provider.getTimeout() == null || provider.getTimeout().isZero() || provider.getTimeout().isNegative()) {
-            return Duration.ofSeconds(150);
-        }
-        return provider.getTimeout().compareTo(Duration.ofSeconds(120)) < 0
-                ? Duration.ofSeconds(120)
-                : provider.getTimeout();
-    }
-
-    private Integer resolveMaxRetries(AiProperties.Provider provider) {
-        if (provider == null || provider.getMaxRetries() == null || provider.getMaxRetries() < 0) {
-            return 2;
-        }
-        return Math.max(2, provider.getMaxRetries());
-    }
-
-    private String resolveModelName(AiProperties.Provider provider) {
-        if (provider != null && !isBlank(provider.getModelName())) {
-            return provider.getModelName();
-        }
-
-        return switch (currentProviderName().toLowerCase(Locale.ROOT)) {
-            case "chatgpt", "openai", "openai-compatible" -> "gpt-4o-mini";
-            case "deepseek" -> "deepseek-chat";
-            case "siliconflow" -> "";
-            default -> "";
-        };
     }
 
     private ShoppingAdvisorAiService getOrCreateShoppingAdvisorAiService() {
@@ -1523,19 +1303,17 @@ public class AiShoppingAdvisorService {
         if (cached != null) {
             return cached;
         }
-
         synchronized (this) {
             if (shoppingAdvisorAiService != null) {
                 return shoppingAdvisorAiService;
             }
-
-            ChatLanguageModel model = getOrCreateModel();
+            ChatLanguageModel model = ensureModel();
             if (model == null) {
                 return null;
             }
-
             shoppingAdvisorAiService = AiServices.builder(ShoppingAdvisorAiService.class)
                     .chatLanguageModel(model)
+                    .chatMemoryProvider(shoppingAdvisorMemoryProvider)
                     .tools(shoppingAdvisorTools)
                     .build();
             return shoppingAdvisorAiService;
@@ -1547,179 +1325,173 @@ public class AiShoppingAdvisorService {
         if (cached != null) {
             return cached;
         }
-
         synchronized (this) {
             if (directShoppingAdvisorAiService != null) {
                 return directShoppingAdvisorAiService;
             }
-
-            ChatLanguageModel model = getOrCreateModel();
+            ChatLanguageModel model = ensureModel();
             if (model == null) {
                 return null;
             }
-
             directShoppingAdvisorAiService = AiServices.builder(DirectShoppingAdvisorAiService.class)
                     .chatLanguageModel(model)
+                    .chatMemoryProvider(directAdvisorMemoryProvider)
                     .build();
             return directShoppingAdvisorAiService;
         }
     }
 
-    private Map<UUID, Integer> aggregateSales(List<OrderItem> soldItems) {
-        return soldItems.stream()
-                .filter(item -> item.getProductId() != null)
-                .collect(Collectors.groupingBy(OrderItem::getProductId, Collectors.summingInt(OrderItem::getQuantity)));
-    }
-
-    private String formatPrice(BigDecimal value) {
-        return value == null ? "0" : value.stripTrailingZeros().toPlainString();
-    }
-
-    private String formatBudgetSummary(BigDecimal budget) {
-        return budget == null ? "未限制预算" : ("¥" + formatPrice(budget) + " 以内");
-    }
-
-    private String formatIntent(String intent) {
-        if (intent == null) {
-            return "综合导购";
+    private ChatLanguageModel ensureModel() {
+        if (chatLanguageModel != null) {
+            return chatLanguageModel;
         }
-        return switch (intent) {
-            case "耳机" -> "音频与降噪";
-            case INTENT_LIFE_SUPPLIES -> "家居日用与生活补货";
-            case "宠物" -> "宠物喂养与外出";
-            case "笔记本" -> "办公与生产力";
-            case "充电器" -> "充电与电源配件";
-            case "手表" -> "智能手表";
-            case "手环" -> "运动手环";
-            case "键盘" -> "键盘外设";
-            case "游戏机" -> "娱乐主机";
-            default -> intent;
+
+        synchronized (this) {
+            if (chatLanguageModel != null) {
+                return chatLanguageModel;
+            }
+
+            AiProperties.Provider provider = currentProvider();
+            if (provider == null || isBlank(provider.getApiKey()) || isBlank(provider.getModelName())) {
+                recordFallback("MODEL_CONFIG_MISSING");
+                return null;
+            }
+
+            try {
+                OpenAiChatModel.OpenAiChatModelBuilder builder = OpenAiChatModel.builder()
+                        .apiKey(provider.getApiKey())
+                        .modelName(provider.getModelName())
+                        .timeout(provider.getTimeout() == null ? Duration.ofSeconds(90) : provider.getTimeout())
+                        .logRequests(provider.isLogRequests())
+                        .logResponses(provider.isLogResponses());
+
+                if (!isBlank(provider.getBaseUrl())) {
+                    builder.baseUrl(provider.getBaseUrl());
+                }
+                if (provider.getMaxRetries() != null) {
+                    builder.maxRetries(provider.getMaxRetries());
+                }
+
+                chatLanguageModel = builder.build();
+                runtimeStatusRef.set(new AiRuntimeStatus(currentProviderName(), activeModelName(), false,
+                        "MODEL_READY", Instant.now(), consecutiveFallbacks.get()));
+                return chatLanguageModel;
+            } catch (Exception error) {
+                recordFallback("MODEL_INIT_FAILED: " + summarizeError(error));
+                return null;
+            }
+        }
+    }
+
+    private void invalidateAiCaches() {
+        chatLanguageModel = null;
+        shoppingAdvisorAiService = null;
+        directShoppingAdvisorAiService = null;
+    }
+
+    private AiProperties.Provider currentProvider() {
+        String providerName = resolveProviderNameWithFallback();
+        return switch (providerName) {
+            case "siliconflow" -> aiProperties.getSiliconflow();
+            case "chatgpt" -> aiProperties.getChatgpt();
+            default -> aiProperties.getDeepseek();
         };
+    }
+
+    private String currentProviderName() {
+        String provider = safe(aiProperties.getProvider()).trim().toLowerCase(Locale.ROOT);
+        return provider.isBlank() ? "deepseek" : provider;
+    }
+
+    private String resolveProviderNameWithFallback() {
+        String preferred = currentProviderName();
+        if (isProviderConfigured(preferred)) {
+            return preferred;
+        }
+        if (isProviderConfigured("deepseek")) {
+            return "deepseek";
+        }
+        if (isProviderConfigured("chatgpt")) {
+            return "chatgpt";
+        }
+        if (isProviderConfigured("siliconflow")) {
+            return "siliconflow";
+        }
+        return preferred;
+    }
+
+    private boolean hasAvailableModelProvider() {
+        return isProviderConfigured("deepseek")
+                || isProviderConfigured("chatgpt")
+                || isProviderConfigured("siliconflow");
+    }
+
+    private boolean isProviderConfigured(String providerName) {
+        AiProperties.Provider provider = switch (safe(providerName).toLowerCase(Locale.ROOT)) {
+            case "chatgpt" -> aiProperties.getChatgpt();
+            case "siliconflow" -> aiProperties.getSiliconflow();
+            default -> aiProperties.getDeepseek();
+        };
+        return provider != null && !isBlank(provider.getApiKey()) && !isBlank(provider.getModelName());
+    }
+
+    private String activeModelName() {
+        AiProperties.Provider provider = currentProvider();
+        return provider == null ? "" : safe(provider.getModelName());
+    }
+
+    private String activeModelLabel() {
+        return currentProviderName() + ":" + blankToDefault(activeModelName(), "unknown-model");
+    }
+
+    private String normalizeReply(String reply) {
+        if (isBlank(reply)) {
+            return null;
+        }
+        String cleaned = reply.replaceAll("(?s)<think>.*?</think>\\s*", "")
+                .replace("\r\n", "\n")
+                .trim();
+        return cleaned.isBlank() ? null : cleaned;
+    }
+
+    private void recordSuccess() {
+        consecutiveFallbacks.set(0);
+        runtimeStatusRef.set(new AiRuntimeStatus(currentProviderName(), activeModelName(), false,
+                "OK", Instant.now(), 0));
+    }
+
+    private void recordFallback(String reason) {
+        int count = consecutiveFallbacks.incrementAndGet();
+        runtimeStatusRef.set(new AiRuntimeStatus(currentProviderName(), activeModelName(), true,
+                blankToDefault(reason, "UNKNOWN"), Instant.now(), count));
+    }
+
+    private String summarizeError(Throwable error) {
+        if (error == null) {
+            return "unknown";
+        }
+        String message = error.getMessage();
+        if (isBlank(message)) {
+            return error.getClass().getSimpleName();
+        }
+        return message.length() > 140 ? message.substring(0, 140) : message;
+    }
+
+    private boolean containsAny(String content, List<String> keywords) {
+        return keywords.stream().anyMatch(content::contains);
+    }
+
+    private String blankToDefault(String value, String fallback) {
+        String normalized = safe(value).trim();
+        return normalized.isBlank() ? fallback : normalized;
     }
 
     private String safe(String value) {
         return value == null ? "" : value;
     }
 
-    private List<String> lifeSuppliesIntentSignals() {
-        return List.of(
-                "\u751f\u6d3b\u7528\u54c1",
-                "\u65e5\u7528\u54c1",
-                "\u5c45\u5bb6\u7528\u54c1",
-                "\u5bb6\u5c45\u7528\u54c1",
-                "\u5bb6\u5ead\u8865\u8d27",
-                "\u65e5\u5e38\u8865\u8d27",
-                "\u751f\u6d3b\u65e5\u7528",
-                "\u62bd\u7eb8",
-                "\u7eb8\u5dfe",
-                "\u6e7f\u5dfe",
-                "\u6d17\u8863",
-                "\u51dd\u73e0",
-                "\u6e05\u6d01",
-                "\u65e5\u5316",
-                "\u5e8a\u54c1",
-                "\u56db\u4ef6\u5957",
-                "\u6795\u5934",
-                "\u9505",
-                "\u7092\u9505",
-                "\u53a8\u5177",
-                "\u6d01\u9762",
-                "\u6da6\u80a4",
-                "\u62a4\u80a4",
-                "\u6d17\u62a4",
-                "\u5bb6\u7eba",
-                "\u5bb6\u5c45");
-    }
-
-    private List<String> lifeSuppliesKeywords() {
-        return List.of(
-                "\u65e5\u7528",
-                "\u5bb6\u5c45",
-                "\u5bb6\u7eba",
-                "\u7eb8\u54c1",
-                "\u62bd\u7eb8",
-                "\u7eb8\u5dfe",
-                "\u6e05\u6d01",
-                "\u6d17\u8863",
-                "\u51dd\u73e0",
-                "\u65e5\u5316",
-                "\u5e8a\u54c1",
-                "\u56db\u4ef6\u5957",
-                "\u6795\u5934",
-                "\u53a8\u623f",
-                "\u53a8\u5177",
-                "\u9505\u5177",
-                "\u7092\u9505",
-                "\u51c0\u996e",
-                "\u6e7f\u5dfe",
-                "\u6d01\u9762",
-                "\u62a4\u80a4",
-                "\u6d17\u62a4");
-    }
-
-    private List<String> nonLifeSuppliesKeywords() {
-        return List.of(
-                "\u8033\u673a",
-                "headphone",
-                "\u7b14\u8bb0\u672c",
-                "laptop",
-                "\u7535\u8111",
-                "keyboard",
-                "\u952e\u76d8",
-                "watch",
-                "\u624b\u8868",
-                "band",
-                "\u624b\u73af",
-                "\u5145\u7535\u5668",
-                "charger",
-                "\u663e\u793a\u5668",
-                "monitor",
-                "\u5e73\u677f",
-                "tablet",
-                "\u6295\u5f71\u4eea",
-                "projector",
-                "\u76f8\u673a",
-                "camera",
-                "\u9f20\u6807",
-                "mouse",
-                "\u5ba0\u7269",
-                "\u732b\u7cae",
-                "\u72d7\u7cae",
-                "\u6bcd\u5a74",
-                "\u5a74\u513f",
-                "\u7eb8\u5c3f\u88e4",
-                "\u98df\u54c1",
-                "\u96f6\u98df",
-                "\u6587\u5177");
-    }
-
     private boolean isBlank(String value) {
         return value == null || value.isBlank();
-    }
-
-    private BigDecimal extractBudget(String message) {
-        if (isBlank(message)) {
-            return null;
-        }
-
-        Matcher matcher = BUDGET_PATTERN.matcher(message);
-        if (matcher.find()) {
-            return new BigDecimal(matcher.group(1));
-        }
-
-        Matcher flexibleMatcher = FLEX_BUDGET_PATTERN.matcher(message);
-        while (flexibleMatcher.find()) {
-            String numeric = flexibleMatcher.group(1);
-            if (numeric == null || numeric.isBlank()) {
-                continue;
-            }
-
-            BigDecimal candidate = new BigDecimal(numeric);
-            if (candidate.compareTo(BigDecimal.valueOf(50)) >= 0) {
-                return candidate;
-            }
-        }
-        return null;
     }
 
     public record AiRuntimeStatus(String provider,
@@ -1731,8 +1503,5 @@ public class AiShoppingAdvisorService {
         private static AiRuntimeStatus initial(String provider, String modelName) {
             return new AiRuntimeStatus(provider, modelName, false, "NOT_CALLED_YET", Instant.now(), 0);
         }
-    }
-
-    private record AdvisorExecution(String reply, AdvisorToolContext.AdvisorToolSnapshot snapshot) {
     }
 }

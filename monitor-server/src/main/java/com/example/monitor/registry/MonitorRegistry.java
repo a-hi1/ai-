@@ -50,6 +50,12 @@ public final class MonitorRegistry {
     public record ServicePurgeResult(boolean accepted, String status, String serverId) {
     }
 
+    public record ServicePortAddResult(boolean accepted, String status, String serverId, int port) {
+    }
+
+    public record AccountPresenceResult(boolean accepted, String status, String serverId, boolean online, int port) {
+    }
+
     private final ObjectMapper mapper;
     private final JdbcHistoryStore jdbcHistoryStore;
     private final Map<String, ServiceState> services = new ConcurrentHashMap<>();
@@ -431,28 +437,218 @@ public final class MonitorRegistry {
         return new ServicePurgeResult(true, "PURGED", normalizedServerId);
     }
 
+    public ServicePortAddResult addManualServicePort(Integer portValue,
+                                                     String host,
+                                                     String serviceName,
+                                                     String serverType,
+                                                     String token,
+                                                     String accountKey) {
+        if (!Objects.equals(controlToken, MonitorProtocol.stringValue(token))) {
+            return new ServicePortAddResult(false, "UNAUTHORIZED", "", 0);
+        }
+
+        String normalizedAccount = MonitorProtocol.stringValue(accountKey);
+        if (normalizedAccount.isBlank()) {
+            return new ServicePortAddResult(false, "INVALID_ACCOUNT", "", 0);
+        }
+
+        int port = portValue == null ? 0 : portValue;
+        if (port <= 0 || port > 65535) {
+            return new ServicePortAddResult(false, "INVALID_PORT", "", port);
+        }
+
+        String normalizedHost = MonitorProtocol.stringValue(host);
+        if (normalizedHost.isBlank()) {
+            normalizedHost = "127.0.0.1";
+        }
+        String normalizedType = MonitorProtocol.stringValue(serverType);
+        if (normalizedType.isBlank()) {
+            normalizedType = "backend";
+        }
+        String normalizedName = MonitorProtocol.stringValue(serviceName);
+        if (normalizedName.isBlank()) {
+            normalizedName = "手动新增端口 " + port;
+        }
+
+        final String resolvedHost = normalizedHost;
+        final String resolvedType = normalizedType;
+        final String resolvedName = normalizedName;
+
+        String serverId = buildManualAccountServerId(normalizedAccount);
+        Instant now = Instant.now();
+        services.compute(serverId, (key, existing) -> {
+            ServiceState current = existing == null ? new ServiceState(serverId) : existing;
+            current.serverType(resolvedType);
+            current.serviceName(resolvedName + " (" + normalizedAccount + ")");
+            current.host(resolvedHost);
+            current.port(port);
+            current.status("OFFLINE");
+            current.registerTime(current.registerTime() == null ? now : current.registerTime());
+            current.lastHeartbeat(now);
+            current.startupTime(current.startupTime() == null ? now : current.startupTime());
+            appendLog(current, now, "MANUAL_PORT", "Account " + normalizedAccount + " mapped to " + resolvedHost + ":" + port);
+            return current;
+        });
+
+        broadcastSnapshot();
+        return new ServicePortAddResult(true, "PORT_ADDED", serverId, port);
+    }
+
+    public AccountPresenceResult updateAccountPresence(String accountKey,
+                                                       Boolean online,
+                                                       Integer portValue,
+                                                       String host,
+                                                       String token) {
+        if (!Objects.equals(controlToken, MonitorProtocol.stringValue(token))) {
+            return new AccountPresenceResult(false, "UNAUTHORIZED", "", false, 0);
+        }
+
+        String normalizedAccount = MonitorProtocol.stringValue(accountKey);
+        if (normalizedAccount.isBlank()) {
+            return new AccountPresenceResult(false, "INVALID_ACCOUNT", "", false, 0);
+        }
+
+        String serverId = buildManualAccountServerId(normalizedAccount);
+        Instant now = Instant.now();
+        boolean targetOnline = Boolean.TRUE.equals(online);
+
+        services.compute(serverId, (key, existing) -> {
+            ServiceState current = existing == null ? new ServiceState(serverId) : existing;
+            int resolvedPort = portValue == null ? current.port() : portValue;
+            if (resolvedPort < 0 || resolvedPort > 65535) {
+                resolvedPort = current.port();
+            }
+            String resolvedHost = MonitorProtocol.stringValue(host);
+            if (resolvedHost.isBlank()) {
+                resolvedHost = MonitorProtocol.blankToEmpty(current.host());
+            }
+            if (resolvedHost.isBlank()) {
+                resolvedHost = "127.0.0.1";
+            }
+
+            current.serverType("backend");
+            current.serviceName("账号节点 " + normalizedAccount);
+            current.host(resolvedHost);
+            current.port(resolvedPort);
+            current.status(targetOnline ? "ONLINE" : "OFFLINE");
+            current.registerTime(current.registerTime() == null ? now : current.registerTime());
+            current.lastHeartbeat(now);
+            current.startupTime(current.startupTime() == null ? now : current.startupTime());
+            appendLog(current, now, targetOnline ? "ACCOUNT_ONLINE" : "ACCOUNT_OFFLINE",
+                    "Account " + normalizedAccount + (targetOnline ? " online" : " offline") + " @ " + resolvedHost + ":" + resolvedPort);
+            return current;
+        });
+
+        ServiceState updated = services.get(serverId);
+        broadcastSnapshot();
+        return new AccountPresenceResult(
+                true,
+                targetOnline ? "ONLINE_UPDATED" : "OFFLINE_UPDATED",
+                serverId,
+                targetOnline,
+                updated == null ? 0 : updated.port());
+    }
+
+    private String buildManualAccountServerId(String accountKey) {
+        String normalizedAccount = MonitorProtocol.stringValue(accountKey)
+                .toLowerCase(Locale.ROOT)
+                .replaceAll("[^a-z0-9]+", "-")
+                .replaceAll("^-+", "")
+                .replaceAll("-+$", "");
+        if (normalizedAccount.isBlank()) {
+            normalizedAccount = "guest";
+        }
+        return "manual-account-" + normalizedAccount;
+    }
+
     private CommandResult launchOfflineRestart(CommandRequest request, String commandId, Instant requestedAt, CommandMessage payload) {
         ServiceState state = services.computeIfAbsent(request.serverId(), ServiceState::new);
+        RestartTargetContext context = resolveRestartTargetContext(request, state);
+
+        if (context.port() <= 0 || context.port() > 65535) {
+            appendLog(state, requestedAt, "COMMAND", "RESTART local launch skipped: invalid target port " + context.port());
+            return new CommandResult(false, "INVALID_TARGET_PORT", null, request.serverId());
+        }
+
+        state.serviceName(context.serviceName());
+        state.serverType(context.serverType());
+        state.host(context.host());
+        state.port(context.port());
+
         Path restartScript = resolveLocalRestartScript(request, state);
         if (restartScript == null) {
-            return new CommandResult(false, "AGENT_NOT_CONNECTED", null, request.serverId());
+            appendLog(state, requestedAt, "COMMAND", "RESTART local launch skipped: restart script not found");
+            return new CommandResult(false, "LOCAL_RESTART_SCRIPT_NOT_FOUND", null, request.serverId());
         }
 
         try {
-            ProcessBuilder processBuilder = new ProcessBuilder(buildRestartCommand(restartScript));
+            ProcessBuilder processBuilder = new ProcessBuilder(buildRestartCommand(restartScript, context));
             Path workingDirectory = restartScript.getParent();
             if (workingDirectory != null && Files.exists(workingDirectory)) {
                 processBuilder.directory(workingDirectory.toFile());
             }
+            processBuilder.redirectOutput(ProcessBuilder.Redirect.DISCARD);
+            processBuilder.redirectError(ProcessBuilder.Redirect.DISCARD);
             processBuilder.start();
             appendLog(state, requestedAt, "COMMAND", "RESTART launched locally by monitor-server");
             persistCommand(commandId, request.serverId(), request.action(), requestedAt, "LOCAL_LAUNCHED", payload);
             broadcastSnapshot();
             return new CommandResult(true, "LOCAL_LAUNCHED", commandId, request.serverId());
         } catch (Exception ex) {
-            appendLog(state, requestedAt, "COMMAND", "RESTART local launch failed: " + ex.getMessage());
-            return new CommandResult(false, "LOCAL_LAUNCH_FAILED", null, request.serverId());
+            String reason = ex.getClass().getSimpleName();
+            appendLog(state, requestedAt, "COMMAND", "RESTART local launch failed: " + reason + " - " + ex.getMessage());
+            return new CommandResult(false, "LOCAL_LAUNCH_FAILED_" + reason.toUpperCase(Locale.ROOT), null, request.serverId());
         }
+    }
+
+    private RestartTargetContext resolveRestartTargetContext(CommandRequest request, ServiceState state) {
+        Map<String, String> args = request == null || request.args() == null ? Map.of() : request.args();
+
+        String serviceName = MonitorProtocol.stringValue(args.get("serviceName"));
+        if (serviceName.isBlank()) {
+            serviceName = state == null ? "" : MonitorProtocol.blankToEmpty(state.serviceName());
+        }
+        if (serviceName.isBlank()) {
+            serviceName = "ecommerce-backend";
+        }
+
+        String serverType = MonitorProtocol.stringValue(args.get("serverType"));
+        if (serverType.isBlank()) {
+            serverType = state == null ? "" : MonitorProtocol.blankToEmpty(state.serverType());
+        }
+        if (serverType.isBlank()) {
+            serverType = "backend";
+        }
+
+        String host = MonitorProtocol.stringValue(args.get("host"));
+        if (host.isBlank()) {
+            host = state == null ? "" : MonitorProtocol.blankToEmpty(state.host());
+        }
+        if (host.isBlank()) {
+            host = "127.0.0.1";
+        }
+
+        int port = MonitorProtocol.intValue(args.get("port"));
+        if (port <= 0 || port > 65535) {
+            int statePort = state == null ? 0 : state.port();
+            if (statePort > 0 && statePort <= 65535) {
+                port = statePort;
+            }
+        }
+        if (port <= 0 || port > 65535) {
+            port = 0;
+        }
+
+        String serviceId = MonitorProtocol.stringValue(args.get("serviceId"));
+        if (serviceId.isBlank()) {
+            serviceId = state == null ? "" : MonitorProtocol.blankToEmpty(state.serverId());
+        }
+
+        String runtimeName = serviceId.isBlank()
+                ? (serviceName.replaceAll("[^a-zA-Z0-9._-]", "-") + "-" + port)
+                : serviceId.replaceAll("[^a-zA-Z0-9._-]", "-");
+
+        return new RestartTargetContext(serviceName, serverType, host, port, serviceId, runtimeName);
     }
 
     private Path resolveLocalRestartScript(CommandRequest request, ServiceState state) {
@@ -467,7 +663,11 @@ public final class MonitorRegistry {
         String serviceName = state == null ? "" : MonitorProtocol.blankToEmpty(state.serviceName());
         Path current = Path.of(System.getProperty("user.dir", ".")).toAbsolutePath().normalize();
         for (int depth = 0; depth < 4 && current != null; depth++) {
-            if ("ecommerce-backend".equalsIgnoreCase(serviceName) || serviceName.isBlank()) {
+            Path genericCandidate = current.resolve("start-monitor-node-instance.ps1");
+            if (Files.exists(genericCandidate)) {
+                return genericCandidate;
+            }
+            if ("ecommerce-backend".equalsIgnoreCase(serviceName) || serviceName.isBlank() || !serviceName.isBlank()) {
                 Path candidate = current.resolve("start-ecommerce-backend.ps1");
                 if (Files.exists(candidate)) {
                     return candidate;
@@ -478,12 +678,46 @@ public final class MonitorRegistry {
         return null;
     }
 
-    private List<String> buildRestartCommand(Path restartScript) {
+    private List<String> buildRestartCommand(Path restartScript, RestartTargetContext context) {
         String script = restartScript.toAbsolutePath().normalize().toString();
+        String serviceName = context.serviceName();
+        String serverType = context.serverType();
+        String host = context.host();
+        int port = context.port();
+        String serviceId = context.serviceId();
+        String runtimeName = context.runtimeName();
+
         if (System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win")) {
-            return List.of("cmd", "/c", "start", "", "powershell", "-ExecutionPolicy", "Bypass", "-File", script);
+            if (script.endsWith("start-monitor-node-instance.ps1")) {
+                return List.of(
+                        "powershell", "-ExecutionPolicy", "Bypass", "-File", script,
+                        "-Action", "restart",
+                        "-ServiceName", serviceName,
+                        "-ServerType", serverType,
+                        "-Port", String.valueOf(port),
+                        "-AdvertiseHost", host,
+                        "-RuntimeName", runtimeName,
+                        "-ServiceId", serviceId);
+            }
+            return List.of(
+                    "powershell", "-ExecutionPolicy", "Bypass", "-File", script,
+                    "-Action", "restart",
+                    "-ServiceName", serviceName,
+                    "-ServerType", serverType,
+                    "-AppPort", String.valueOf(port),
+                    "-AdvertiseHost", host,
+                    "-RuntimeName", runtimeName,
+                    "-ServiceId", serviceId);
         }
         return List.of("sh", script);
+    }
+
+    private record RestartTargetContext(String serviceName,
+                                        String serverType,
+                                        String host,
+                                        int port,
+                                        String serviceId,
+                                        String runtimeName) {
     }
 
     public SnapshotEvent snapshotEvent() {

@@ -4,7 +4,6 @@
       <div>
         <p class="eyebrow">订单时间线</p>
         <h1>订单中心</h1>
-        <p class="copy">查看你的下单记录、状态和消费汇总。每次沙箱支付后都可以在这里确认结果。</p>
       </div>
       <div class="summary-grid" v-if="currentUser">
         <article class="summary-card">
@@ -17,20 +16,18 @@
         </article>
         <article class="summary-card warm">
           <span>累计金额</span>
-          <strong>¥{{ totalSpent }}</strong>
+          <strong>{{ totalSpent }} 元</strong>
         </article>
       </div>
     </header>
 
     <div v-if="!currentUser" class="empty-state">
       <h2>请先登录</h2>
-      <p>登录后可查看订单时间线和支付结果。</p>
       <RouterLink class="action-link" to="/login">前往登录</RouterLink>
     </div>
 
     <div v-else class="orders-panel">
       <div class="toolbar">
-        <p>{{ toolbarMessage }}</p>
         <button class="refresh" :disabled="loading" @click="loadOrders">{{ loading ? '刷新中...' : '刷新订单' }}</button>
       </div>
 
@@ -74,7 +71,7 @@
             </div>
             <div>
               <span class="order-label">金额</span>
-              <strong>¥{{ Number(order.totalAmount).toFixed(2) }}</strong>
+              <strong>{{ Number(order.totalAmount).toFixed(2) }} 元</strong>
             </div>
             <div>
               <span class="order-label">商品数量</span>
@@ -89,10 +86,19 @@
           <div class="goods-brief">
             <div class="goods-brief-head">
               <span class="order-label">购买内容</span>
-              <strong>{{ summarizeItems(order) }}</strong>
+              <strong>共 {{ order.itemCount }} 件</strong>
             </div>
             <div class="goods-list">
-              <article v-for="item in previewItemsOf(order)" :key="`${order.id}-${item.productId}`" class="goods-pill">
+              <article
+                v-for="item in previewItemsOf(order)"
+                :key="`${order.id}-${item.productId}`"
+                class="goods-pill clickable"
+                role="button"
+                tabindex="0"
+                @click="openPreviewItem(item)"
+                @keyup.enter="openPreviewItem(item)"
+                @keyup.space.prevent="openPreviewItem(item)"
+              >
                 <img :src="item.imageUrl || fallbackImage(item.productId)" :alt="item.productName" loading="lazy" decoding="async" />
                 <div>
                   <strong>{{ item.productName }}</strong>
@@ -113,7 +119,7 @@ import { RouterLink, useRoute, useRouter } from 'vue-router'
 
 import { useCart } from '../composables/useCart'
 import { useAuth } from '../composables/useAuth'
-import { api, type OrderDto } from '../services/api'
+import { api, type OrderDto, type OrderPreviewItemDto } from '../services/api'
 
 const { currentUser } = useAuth()
 const { refreshCart } = useCart()
@@ -144,13 +150,6 @@ const filteredOrders = computed(() => {
   if (activeFilter.value === 'ALL') return orders.value
   return orders.value.filter(order => order.status === activeFilter.value)
 })
-const toolbarMessage = computed(() => {
-  if (loading.value) return '正在刷新订单列表...'
-  if (activeFilter.value === 'ALL') return '展示当前用户的全部订单记录'
-  const activeOption = filterOptions.find(option => option.value === activeFilter.value)
-  return `当前展示${activeOption?.label || '订单'}记录`
-})
-
 const formatTime = (value: string) => {
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? '-' : date.toLocaleString()
@@ -167,18 +166,24 @@ const fallbackImage = (seed: string) => `https://picsum.photos/72/72?random=${se
 
 const previewItemsOf = (order: OrderDto) => order.previewItems ?? []
 
-const summarizeItems = (order: OrderDto) => {
-  const previewItems = previewItemsOf(order)
-
-  if (!previewItems.length) {
-    return `共 ${order.itemCount} 件商品`
+const cachePreviewItem = (item: OrderPreviewItemDto) => {
+  try {
+    window.sessionStorage.setItem(`product-preview:${item.productId}`, JSON.stringify({
+      id: item.productId,
+      name: item.productName,
+      description: '',
+      price: 0,
+      imageUrl: item.imageUrl || fallbackImage(item.productId),
+      tags: ''
+    }))
+  } catch {
+    // ignore session storage failures
   }
+}
 
-  const names = previewItems.map(item => item.productName)
-  const preview = names.join('、')
-  return order.itemCount > previewItems.length
-    ? `${preview} 等 ${order.itemCount} 件`
-    : `${preview} · 共 ${order.itemCount} 件`
+const openPreviewItem = (item: OrderPreviewItemDto) => {
+  cachePreviewItem(item)
+  router.push(`/products/${item.productId}`)
 }
 
 const selectFilter = (status: string) => {
@@ -523,6 +528,19 @@ h1 {
   border-radius: 14px;
   background: #fff;
   border: 1px solid #eadfce;
+}
+
+.goods-pill.clickable {
+  cursor: pointer;
+  transition: transform 180ms ease, box-shadow 180ms ease, border-color 180ms ease;
+}
+
+.goods-pill.clickable:hover,
+.goods-pill.clickable:focus-visible {
+  transform: translateY(-2px);
+  border-color: #d8c2a2;
+  box-shadow: 0 12px 22px rgba(73, 52, 24, 0.08);
+  outline: none;
 }
 
 .goods-pill img {

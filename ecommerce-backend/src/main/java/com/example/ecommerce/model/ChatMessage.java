@@ -11,6 +11,7 @@ public class ChatMessage {
     @Id
     private UUID id;
     private UUID userId;
+    private String sessionId;
     private String role;
     private String content;
     private Instant createdAt;
@@ -18,9 +19,10 @@ public class ChatMessage {
     public ChatMessage() {
     }
 
-    public ChatMessage(UUID id, UUID userId, String role, String content, Instant createdAt) {
+    public ChatMessage(UUID id, UUID userId, String sessionId, String role, String content, Instant createdAt) {
         this.id = id;
         this.userId = userId;
+        this.sessionId = sessionId;
         this.role = role;
         this.content = content;
         this.createdAt = createdAt;
@@ -40,6 +42,14 @@ public class ChatMessage {
 
     public void setUserId(UUID userId) {
         this.userId = userId;
+    }
+
+    public String getSessionId() {
+        return sessionId;
+    }
+
+    public void setSessionId(String sessionId) {
+        this.sessionId = sessionId;
     }
 
     public String getRole() {

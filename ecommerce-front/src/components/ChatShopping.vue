@@ -1,9 +1,9 @@
-<template>
+﻿<template>
   <section class="shopping-shell">
     <div class="hero-toggle-bar">
       <div class="hero-toggle-left">
         <span class="hero-mini-brand">AI 导购</span>
-        <span class="connection-state" :class="backendReachable ? 'online' : 'offline'">{{ backendReachable ? '后端在线' : '本地兜底' }}</span>
+        <span class="connection-state" :class="connectionStateClass">{{ connectionStateText }}</span>
         <span class="secondary-badge">{{ latestBudgetSummary }}</span>
       </div>
       <div class="hero-toggle-right">
@@ -17,7 +17,7 @@
         <p class="eyebrow">Guide</p>
         <h1>AI 导购</h1>
         <p class="hero-lead">
-          把预算、使用场景和偏好一次说清楚，我会先帮你缩小商品范围，再给出主推、备选和搭配建议。
+          不管买什么商品，跟我说一声，我会按品类追问关键需求，再给出主推款、备选款和逻辑成立的搭配建议。
         </p>
 
         <div class="hero-notes">
@@ -111,11 +111,7 @@
                 <button :class="['mode-btn', answerMode === 'brief' ? 'active' : '']" @click="answerMode = 'brief'">简略</button>
                 <button :class="['mode-btn', answerMode === 'detailed' ? 'active' : '']" @click="answerMode = 'detailed'">详细</button>
               </div>
-              <button :class="['guided-switch-btn', guidedModeEnabled ? 'active' : '']" @click="guidedModeEnabled = !guidedModeEnabled">
-                {{ guidedModeEnabled ? '实时导购: 已开启' : '实时导购: 已关闭' }}
-              </button>
-              <span v-if="guidedActive" class="secondary-badge">需求采集中 · 第 {{ guidedStep + 1 }} 步</span>
-              <span class="connection-state" :class="backendReachable ? 'online' : 'offline'">{{ backendReachable ? '后端在线' : '本地兜底' }}</span>
+              <span class="connection-state" :class="connectionStateClass">{{ connectionStateText }}</span>
             </div>
             <div class="session-actions">
               <button class="secondary-btn slim-btn" @click="startNewConversation">新增对话</button>
@@ -124,45 +120,16 @@
           </div>
         </div>
 
-        <div v-if="latestTraceSteps.length" class="recent-analysis-panel">
-          <div class="recent-analysis-head">
-            <strong>最近一次分析轨迹</strong>
-            <span>共 {{ latestTraceSteps.length }} 步</span>
-          </div>
-          <div class="tool-trace-list">
-            <span v-for="(trace, traceIndex) in latestTraceSteps" :key="`latest-trace-${traceIndex}`" class="trace-pill">
-              {{ trace }}
-            </span>
-          </div>
-        </div>
-
         <div class="chat-container" ref="chatRef">
-          <div v-if="analysisVisible" class="analysis-live-panel">
-            <div class="analysis-live-head">
-              <strong>{{ sending ? 'AI 正在分析中' : '分析完成' }}</strong>
-              <span>{{ analysisElapsedLabel }}</span>
-            </div>
-            <div class="analysis-live-steps">
-              <div
-                v-for="(step, stepIndex) in analysisProgressSteps"
-                :key="step"
-                :class="['analysis-step', stepIndex <= analysisStepIndex ? 'done' : 'pending']"
-              >
-                <span class="dot"></span>
-                <span>{{ step }}</span>
-              </div>
-            </div>
-          </div>
-
           <div class="message-item system">
-            <div class="avatar">导</div>
+            <div class="avatar">😊</div>
             <div class="content">
               <div class="meta-row">
                 <span class="speaker">AI 导购助手</span>
                 <span class="timestamp">{{ formatTime(systemTimestamp) }}</span>
               </div>
               <div class="text assistant-text system-text">
-                <div v-for="(block, blockIndex) in formatAssistantBlocks('直接描述你的预算、场景和偏好。我会先判断需求，再把推荐拆成主推款、备选款和搭配加购，方便你直接决策。')" :key="`system-${blockIndex}`" :class="['text-block', block.tone]">
+                <div v-for="(block, blockIndex) in formatAssistantBlocks('告诉我你想买什么，我会按品类追问预算、场景和细节偏好，再给出最合适的主推款、备选款，以及真正用得上的搭配推荐。')" :key="`system-${blockIndex}`" :class="['text-block', block.tone]">
                   <span class="text-emoji">{{ block.emoji }}</span>
                   <span class="text-line" v-html="block.html"></span>
                 </div>
@@ -170,8 +137,8 @@
             </div>
           </div>
 
-          <div v-for="(msg, index) in messageList" :key="`${msg.role}-${index}-${msg.timestamp}`" :class="['message-item', msg.role]">
-            <div class="avatar">{{ msg.role === 'user' ? '你' : '导' }}</div>
+          <div v-for="(msg, index) in visibleMessageList" :key="`${msg.role}-${index}-${msg.timestamp}`" :class="['message-item', msg.role]">
+            <div class="avatar">{{ msg.role === 'user' ? '👤' : '😊' }}</div>
             <div class="content">
               <div class="meta-row">
                 <span class="speaker">{{ msg.role === 'user' ? '你的需求' : 'AI 导购建议' }}</span>
@@ -189,39 +156,11 @@
               </div>
               <div v-if="msg.role === 'user'" class="text">{{ msg.content }}</div>
 
-              <div v-if="msg.role === 'assistant' && answerMode === 'detailed' && (msg.detectedIntent || msg.budgetSummary)" class="message-summary">
-                <span v-if="msg.detectedIntent" class="summary-pill">{{ msg.detectedIntent }}</span>
-                <span v-if="msg.budgetSummary" class="summary-pill">{{ msg.budgetSummary }}</span>
-                <span v-if="msg.fallback" class="summary-pill warning">已切换兜底建议</span>
-              </div>
-
-              <div v-if="msg.role === 'assistant' && answerMode === 'detailed' && msg.fallback && fallbackReasonText(msg)" class="fallback-reason-banner">
-                <strong>兜底原因</strong>
-                <span>{{ fallbackReasonText(msg) }}</span>
-              </div>
-
-              <div v-if="answerMode === 'detailed' && (msg.insights?.length || msg.goodsList?.length)" class="advisor-brief">
-                <div v-if="firstRecommendedGoods(msg)" class="brief-card spotlight">
-                  <span>本轮主推</span>
-                  <strong>{{ firstRecommendedGoods(msg)?.name }}</strong>
-                  <small>{{ recommendationHeadline(firstRecommendedGoods(msg)!, 0) }}</small>
+              <div v-if="msg.goodsList?.length" class="result-showcase">
+                <div class="result-showcase-head">
+                  <strong>推荐结果展示</strong>
                 </div>
-                <div v-for="insight in (msg.insights ?? []).slice(0, 4)" :key="`${insight.label}-${insight.value}`" class="brief-card">
-                  <span>{{ insight.label }}</span>
-                  <strong>{{ insight.value }}</strong>
-                </div>
-              </div>
-
-              <div v-if="msg.role === 'assistant' && answerMode === 'detailed' && toolTraceSteps(msg).length" class="tool-trace-panel">
-                <strong>分析过程</strong>
-                <div class="tool-trace-list">
-                  <span v-for="(trace, traceIndex) in toolTraceSteps(msg)" :key="`${msg.timestamp}-trace-${traceIndex}`" class="trace-pill">
-                    {{ trace }}
-                  </span>
-                </div>
-              </div>
-
-              <div v-if="msg.goodsList?.length" class="goods-list">
+              <div class="goods-list">
                 <div class="goods-card" v-for="(goods, goodsIndex) in msg.goodsList" :key="goods.id">
                   <div class="goods-media">
                     <img :src="goods.image" alt="商品图片" class="goods-img" loading="lazy" decoding="async" />
@@ -231,27 +170,20 @@
                     </div>
                   </div>
                   <div class="goods-info">
-                    <div class="goods-kicker">
-                      <span class="goods-role">{{ recommendationRole(goodsIndex) }}</span>
-                      <span class="goods-fit">{{ recommendationHeadline(goods, goodsIndex) }}</span>
-                    </div>
                     <div class="goods-headline">
                       <div class="goods-name">{{ goods.name }}</div>
                       <div class="goods-price">{{ formatCurrency(goods.price) }}</div>
                     </div>
-                    <div class="goods-desc">{{ goodsDescription(goods) }}</div>
-                    <div class="reason-block">
-                      <strong>推荐理由</strong>
-                      <p>{{ goods.reason }}</p>
-                    </div>
-                    <div class="goods-meta">
-                      <span class="meta-pill" :class="goods.withinBudget ? 'budget-ok' : 'budget-risk'">
-                        {{ goods.withinBudget ? '预算内' : '预算外替代' }}
-                      </span>
-                      <span class="meta-pill">{{ recommendationSupport(goods, goodsIndex) }}</span>
-                    </div>
                     <div v-if="goods.tags?.length" class="tag-list compact">
                       <span v-for="tag in goods.tags" :key="tag" class="tag-pill">{{ tag }}</span>
+                    </div>
+                    <div v-if="formatReasonLines(goods).length" class="reason-panel">
+                      <div class="reason-title">推荐理由</div>
+                      <ul class="reason-list">
+                        <li v-for="(line, reasonIndex) in formatReasonLines(goods)" :key="`reason-${goods.id}-${reasonIndex}`">
+                          {{ line }}
+                        </li>
+                      </ul>
                     </div>
                   </div>
                   <div class="goods-actions">
@@ -262,11 +194,12 @@
                   </div>
                 </div>
               </div>
+              </div>
 
               <div v-if="msg.relatedGoods?.length" class="related-deck">
                 <div class="related-head">
-                  <strong>相关搭配加购</strong>
-                  <span>适合和主推商品一起比较或顺手加购</span>
+                  <strong>{{ relatedDeckTitle(msg) }}</strong>
+                  <span>{{ relatedDeckSubtitle(msg) }}</span>
                 </div>
                 <div class="related-grid">
                   <article v-for="related in msg.relatedGoods" :key="`related-${msg.timestamp}-${related.id}`" class="related-card">
@@ -274,12 +207,11 @@
                     <div class="related-info">
                       <strong>{{ related.name }}</strong>
                       <span>{{ formatCurrency(related.price) }}</span>
-                      <p>{{ related.reason }}</p>
                     </div>
                     <div class="related-actions">
                       <button class="mini-ghost-btn" @click="viewProduct(related)">详情</button>
                       <button class="mini-cart-btn" @click="addToCart(related)">
-                        {{ isInCart(related.id) ? '继续加购' : '搭配加购' }}
+                        {{ isInCart(related.id) ? '再加一件' : '加入搭配' }}
                       </button>
                     </div>
                   </article>
@@ -289,23 +221,62 @@
           </div>
         </div>
 
+        <div v-if="analysisVisible" class="analysis-live-panel">
+          <div class="analysis-live-head">
+            <strong>{{ sending ? 'AI 正在分析中' : '分析完成' }}</strong>
+            <span>{{ analysisElapsedLabel }}</span>
+          </div>
+          <div class="analysis-live-steps">
+            <div
+              v-for="(step, stepIndex) in analysisProgressSteps"
+              :key="step"
+              :class="['analysis-step', stepIndex <= analysisStepIndex ? 'done' : 'pending']"
+            >
+              <span class="dot"></span>
+              <span>{{ step }}</span>
+            </div>
+          </div>
+        </div>
+
         <div class="input-container">
+          <div class="advice-mode-selector">
+            <span class="mode-label">推荐模式</span>
+            <button 
+              :class="['mode-btn', { active: adviceMode === 'deep' }]" 
+              @click="adviceMode = 'deep'"
+              title="利用知识库进行多轮智能澄清，推荐精准度高"
+            >
+              💡 深度模式
+            </button>
+            <button 
+              :class="['mode-btn', { active: adviceMode === 'quick' }]" 
+              @click="adviceMode = 'quick'"
+              title="快速提取核心信息，2-3句话给出方案"
+            >
+              ⚡ 快速模式
+            </button>
+          </div>
+
           <div class="emoji-bar">
             <button v-for="emoji in emojiSuggestions" :key="emoji" class="emoji-chip" type="button" @click="appendEmoji(emoji)">{{ emoji }}</button>
           </div>
-          <input
-            v-model="inputValue"
-            type="text"
-            placeholder="例如：预算 3000 元以内，帮我推荐适合通勤和视频会议的降噪耳机"
-            class="chat-input"
-            @keyup.enter="sendMessage"
-          />
-          <button class="voice-btn" :class="{ active: listening }" @click="toggleVoiceInput">
-            {{ listening ? '停止语音' : '语音输入' }}
-          </button>
-          <button class="send-btn" :disabled="sending" @click="sendMessage">
-            {{ sending ? '分析中...' : '发送需求' }}
-          </button>
+          <div class="input-main-row">
+            <input
+              v-model="inputValue"
+              type="text"
+              placeholder="例如：预算 3000 元以内，帮我推荐适合通勤和视频会议的降噪耳机"
+              class="chat-input"
+              @keyup.enter="sendMessage"
+            />
+            <div class="input-actions">
+              <button class="voice-btn compact" :class="{ active: listening }" @click="toggleVoiceInput">
+                {{ listening ? '停止' : '语音' }}
+              </button>
+              <button class="send-btn compact" :disabled="sending" @click="sendMessage">
+                {{ sending ? '分析中' : '发送' }}
+              </button>
+            </div>
+          </div>
         </div>
     </div>
 
@@ -326,7 +297,6 @@
             <div v-else class="cart-item" v-for="item in cartItems" :key="item.id">
               <button class="cart-item-main" @click="viewProduct(item)">
                 <div class="cart-item-name">{{ item.name }}</div>
-                <div class="cart-item-desc">{{ item.desc }}</div>
               </button>
               <div class="cart-item-meta">
                 <div class="cart-stepper">
@@ -355,13 +325,12 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
-import { productCardDescription } from '../catalog'
 import { useAuth } from '../composables/useAuth'
 import { useCart } from '../composables/useCart'
-import { api, type AiProviderOverviewDto, type ChatRecommendationDto, type ProductDto } from '../services/api'
+import { api, type AiProviderOverviewDto, type ChatRecommendationDto, type ChatStreamProgress, type ProductDto } from '../services/api'
 import {
   createChatSession,
   ensureImportedHistorySession,
@@ -418,10 +387,22 @@ type GuidedRequirementProfile = {
   budget: number | null
   usage: string
   brand: string
-  camera: string
-  battery: string
-  performance: string
-  storage: string
+  detailA: string
+  detailB: string
+}
+
+type GuidedStep = {
+  key: keyof GuidedRequirementProfile
+  question: string
+  required?: boolean
+}
+
+type CategoryGuideStrategy = {
+  id: string
+  matchKeywords: string[]
+  detailALabel: string
+  detailBLabel: string
+  steps: GuidedStep[]
 }
 
 const inputValue = ref('')
@@ -449,10 +430,12 @@ const providerForm = ref({
 const analysisStepIndex = ref(0)
 const analysisElapsedSeconds = ref(0)
 const analysisVisible = ref(false)
+const analysisLiveSteps = ref<string[]>([])
 const cartOpen = ref(false)
 const answerMode = ref<'brief' | 'detailed'>('detailed')
+const adviceMode = ref<'deep' | 'quick'>('deep')
 const heroExpanded = ref(false)
-const guidedModeEnabled = ref(true)
+const guidedModeEnabled = ref(false)
 const guidedActive = ref(false)
 const guidedStep = ref(0)
 const guidedQuestionCount = ref(0)
@@ -462,33 +445,113 @@ const guidedProfile = ref<GuidedRequirementProfile>({
   budget: null,
   usage: '',
   brand: '',
-  camera: '',
-  battery: '',
-  performance: '',
-  storage: ''
+  detailA: '',
+  detailB: ''
 })
 
-const PHONE_GUIDED_STEPS: Array<{ key: keyof GuidedRequirementProfile, question: string, required?: boolean }> = [
-  { key: 'budget', question: '先确认预算：你预计手机预算是多少？例如 2500 / 3500 / 5000+。', required: true },
-  { key: 'usage', question: '主要使用场景是？例如日常流畅、拍照、游戏、商务、长辈使用。', required: true },
-  { key: 'brand', question: '有品牌偏好吗？例如华为/小米/OPPO/vivo/苹果，还是都可以？', required: true },
-  { key: 'camera', question: '拍照需求到什么程度？重视人像、夜景、视频防抖，还是一般记录即可？' },
-  { key: 'battery', question: '续航和快充有要求吗？比如重度一天一充、至少 5000mAh、快充 80W+。' },
-  { key: 'performance', question: '性能优先级如何？偏重大型游戏，还是只要日常顺滑即可？' },
-  { key: 'storage', question: '存储容量希望多大？128G / 256G / 512G。', required: true }
+const BASE_GUIDED_STEPS: GuidedStep[] = [
+  { key: 'category', question: '你这次想买什么商品？可以直接说品类，比如手机、耳机、电脑、零食、护肤品。', required: true },
+  { key: 'budget', question: '预算大概是多少？例如 300、1500、5000 以内，或者说预算不限。', required: true }
 ]
 
+const CATEGORY_GUIDE_STRATEGIES: CategoryGuideStrategy[] = [
+  {
+    id: 'audio',
+    matchKeywords: ['耳机', 'headphone', 'audio', 'buds', 'airpods', 'freebuds'],
+    detailALabel: '核心功能偏好',
+    detailBLabel: '佩戴与舒适度',
+    steps: [
+      { key: 'usage', question: '耳机主要用在什么场景？比如通勤降噪、视频会议、运动、睡前听歌。', required: true },
+      { key: 'brand', question: '有品牌偏好吗？例如索尼、华为、苹果，或者都可以。', required: true },
+      { key: 'detailA', question: '更看重哪一点？降噪强度、音质表现、通话清晰度还是续航。', required: true },
+      { key: 'detailB', question: '佩戴方式和舒适度有没有要求？比如入耳、头戴、久戴不胀耳、适合运动。'}
+    ]
+  },
+  {
+    id: 'skincare',
+    matchKeywords: ['护肤', '面膜', '面霜', '精华', '乳液', '洁面', '护肤品'],
+    detailALabel: '肤质情况',
+    detailBLabel: '核心功效',
+    steps: [
+      { key: 'usage', question: '准备在什么场景下用？比如日常维稳、换季修护、熬夜急救、送礼。', required: true },
+      { key: 'brand', question: '有品牌偏好吗？比如理肤泉、CeraVe、欧莱雅，或者都可以。', required: true },
+      { key: 'detailA', question: '你的肤质更偏哪种？干皮、油皮、混干、混油还是敏感肌。', required: true },
+      { key: 'detailB', question: '最想解决什么问题？保湿、修护、控油、提亮、抗老、清洁。', required: true }
+    ]
+  },
+  {
+    id: 'laptop',
+    matchKeywords: ['电脑', '笔记本', 'laptop', 'notebook', '轻薄本', '办公本', '游戏本', '平板'],
+    detailALabel: '配置取向',
+    detailBLabel: '形态细节',
+    steps: [
+      { key: 'usage', question: '主要做什么？办公、上课、设计、编程、剪辑还是游戏。', required: true },
+      { key: 'brand', question: '有品牌偏好吗？例如联想、华硕、苹果、戴尔，或者都可以。', required: true },
+      { key: 'detailA', question: '更偏向轻薄续航还是性能释放？也可以直接说想要的内存、屏幕或芯片档位。', required: true },
+      { key: 'detailB', question: '还有什么细节要求？比如接口丰富、屏幕素质、静音、重量、便携。'}
+    ]
+  },
+  {
+    id: 'food',
+    matchKeywords: ['零食', '咖啡', '饮料', '牛奶', '茶叶', '坚果', '食品'],
+    detailALabel: '口味偏好',
+    detailBLabel: '限制条件',
+    steps: [
+      { key: 'usage', question: '主要是自己吃、办公室囤货、早餐补给，还是送礼分享？', required: true },
+      { key: 'brand', question: '有品牌偏好吗？没有的话也可以说都可以。', required: true },
+      { key: 'detailA', question: '更偏什么口味或方向？比如低糖、提神、香脆、浓郁、耐吃。', required: true },
+      { key: 'detailB', question: '有没有需要避开的点？比如太甜、咖啡因、过敏原、独立包装。'}
+    ]
+  },
+  {
+    id: 'pet',
+    matchKeywords: ['宠物', '猫粮', '狗粮', '猫咪', '狗狗', '猫砂'],
+    detailALabel: '宠物情况',
+    detailBLabel: '功能偏好',
+    steps: [
+      { key: 'usage', question: '是日常喂养、外出出行、看诊，还是补常备用品？', required: true },
+      { key: 'brand', question: '有品牌偏好吗？比如网易严选、皇家、霍尼韦尔，或者都可以。', required: true },
+      { key: 'detailA', question: '宠物目前是什么情况？比如成猫、幼猫、挑食、肠胃敏感、需要外出。', required: true },
+      { key: 'detailB', question: '更看重什么？适口性、成分、安全感、透气性、便携性。'}
+    ]
+  },
+  {
+    id: 'default',
+    matchKeywords: [],
+    detailALabel: '关键偏好',
+    detailBLabel: '补充限制',
+    steps: [
+      { key: 'usage', question: '主要用在什么场景？比如通勤、办公、送礼、家用、学生使用。', required: true },
+      { key: 'brand', question: '有品牌偏好吗？如果没有也可以直接说都可以。', required: true },
+      { key: 'detailA', question: '你最在意的是什么？比如性能、颜值、尺寸、续航、材质、口味、功效。', required: true },
+      { key: 'detailB', question: '还有没有必须满足或必须避开的条件？没有可以直接说没要求。'}
+    ]
+  }
+]
+
+const CATEGORY_KEYWORDS = [
+  '手机', '耳机', '电脑', '笔记本', '平板', '显示器', '键盘', '鼠标', '相机', '手表', '手环',
+  '电视', '冰箱', '空调', '洗衣机', '风扇', '路由器', '音箱', '麦克风', '充电器', '充电宝',
+  '零食', '牛奶', '咖啡', '饮料', '白酒', '红酒', '茶叶', '水果', '大米', '食用油',
+  '护肤品', '面膜', '面霜', '精华', '口红', '粉底', '香水', '洗发水', '沐浴露',
+  '衣服', '外套', '羽绒服', '裤子', '鞋', '跑鞋', '球鞋', '背包', '行李箱'
+]
+
+const HIDDEN_GOODS_TAGS = new Set(['xlsx', 'csv', '精选商品', '精选'])
+
 const FUZZY_UNKNOWN_WORDS = ['都可以', '都行', '无所谓', '随便', '不太清楚', '不清楚', '不确定', '你决定', '没要求']
-const analysisProgressSteps = [
+const DEFAULT_ANALYSIS_PROGRESS_STEPS = [
   '识别需求与预算',
   '检索商品候选',
   '匹配场景与偏好',
   '生成推荐理由',
   '整理最终答复'
 ]
+const MAX_VISIBLE_MESSAGES = 40
 
 let analysisTimer: number | null = null
 let analysisStartedAt = 0
+let scrollFrameId: number | null = null
 
 let recognition: SpeechRecognitionLike | null = null
 
@@ -507,13 +570,28 @@ const {
 } = useCart()
 
 const assistantMessages = computed(() => messageList.value.filter(item => item.role === 'assistant'))
+const visibleMessageList = computed(() => {
+  if (messageList.value.length <= MAX_VISIBLE_MESSAGES) {
+    return messageList.value
+  }
+  return messageList.value.slice(-MAX_VISIBLE_MESSAGES)
+})
 const latestAssistantMessage = computed(() => {
   const messages = assistantMessages.value
   return messages.length ? messages[messages.length - 1] : null
 })
 const latestBudgetSummary = computed(() => latestAssistantMessage.value?.budgetSummary ?? '未设置预算')
-const latestAdvisorMode = computed(() => latestAssistantMessage.value?.fallback ? '规则兜底导购' : '实时 AI 导购')
+const latestAdvisorMode = computed(() => {
+  if (!currentUser.value) {
+    return '未登录'
+  }
+  return latestAssistantMessage.value?.fallback ? '规则兜底导购' : '实时 AI 导购'
+})
 const latestAdvisorSource = computed(() => {
+  if (!currentUser.value) {
+    return '登录后可开启实时导购'
+  }
+
   if (!latestAssistantMessage.value) {
     return backendReachable.value ? '等待实时推荐' : '当前可回退到本地兜底'
   }
@@ -522,11 +600,25 @@ const latestAdvisorSource = computed(() => {
 })
 const assistantMessageCount = computed(() => assistantMessages.value.length)
 const cartTotalLabel = computed(() => formatCurrency(Number(totalPrice.value)))
+const connectionStateClass = computed(() => {
+  if (!currentUser.value) {
+    return 'offline'
+  }
+  return backendReachable.value ? 'online' : 'offline'
+})
+const connectionStateText = computed(() => {
+  if (!currentUser.value) {
+    return '离线(未登录)'
+  }
+  return backendReachable.value ? '后端在线' : '本地兜底'
+})
 const advisorUser = computed(() => {
-  return useDemoAdvisor.value || !currentUser.value ? DEMO_GUIDE_USER : currentUser.value
+  if (useDemoAdvisor.value || !currentUser.value) {
+    return DEMO_GUIDE_USER
+  }
+  return currentUser.value
 })
 const advisorUserId = computed(() => advisorUser.value.id)
-const advisorUserName = computed(() => advisorUser.value.displayName || advisorUser.value.email || '访客')
 const activeSessionTitle = computed(() => {
   const activeSession = sessionList.value.find(session => session.id === activeSessionId.value)
   return activeSession?.title || '新对话'
@@ -588,6 +680,10 @@ const parseBudgetFromText = (text: string) => {
 const includesAny = (text: string, keywords: string[]) => keywords.some(keyword => text.includes(keyword))
 const isFuzzyUnknownAnswer = (text: string) => includesAny(text.toLowerCase(), FUZZY_UNKNOWN_WORDS)
 const wantsDirectRecommendation = (text: string) => includesAny(text.toLowerCase(), ['直接推荐', '直接给推荐', '你直接推荐', '你帮我定', '不用问了', '先推荐'])
+const hasDirectCommodityDemand = (text: string) => {
+  return includesAny(text.toLowerCase(), CATEGORY_KEYWORDS)
+    || includesAny(text.toLowerCase(), ['mp3', '播放器', '随身听', '鼠标', 'keyboard', 'mouse', '耳机', '笔记本', '充电器'])
+}
 
 const markGuidedStepSkipped = (key: keyof GuidedRequirementProfile) => {
   if (!guidedSkippedKeys.value.includes(key)) {
@@ -595,12 +691,70 @@ const markGuidedStepSkipped = (key: keyof GuidedRequirementProfile) => {
   }
 }
 
+const detectCategoryFromText = (rawMessage: string) => {
+  const text = rawMessage.toLowerCase().trim()
+  const matched = CATEGORY_KEYWORDS.find(keyword => text.includes(keyword))
+  if (matched) {
+    return matched
+  }
+
+  const extracted = rawMessage.match(/(?:买|购|要|想要|想买|需要)([^，。！？,.]{1,12})/)
+  if (extracted?.[1]) {
+    return extracted[1].trim()
+  }
+
+  if (rawMessage.length <= 12 && !isFuzzyUnknownAnswer(rawMessage)) {
+    return rawMessage.trim()
+  }
+
+  return ''
+}
+
+const getGuideStrategy = (category: string) => {
+  const normalized = (category || '').toLowerCase()
+  return CATEGORY_GUIDE_STRATEGIES.find(strategy => strategy.matchKeywords.some(keyword => normalized.includes(keyword.toLowerCase())))
+    || CATEGORY_GUIDE_STRATEGIES.find(strategy => strategy.id === 'default')!
+}
+
+const getGuidedSteps = () => {
+  const strategy = getGuideStrategy(guidedProfile.value.category)
+  return [...BASE_GUIDED_STEPS, ...strategy.steps]
+}
+
+const fillCurrentGuidedAnswer = (step: GuidedStep | undefined, rawMessage: string) => {
+  if (!step || isGuidedStepDone(step.key) || isFuzzyUnknownAnswer(rawMessage)) {
+    return
+  }
+
+  if (step.key === 'category') {
+    guidedProfile.value.category = guidedProfile.value.category || detectCategoryFromText(rawMessage) || rawMessage.trim()
+    return
+  }
+
+  if (step.key === 'budget') {
+    const budget = parseBudgetFromText(rawMessage)
+    if (budget !== null) {
+      guidedProfile.value.budget = budget
+    }
+    return
+  }
+
+  const value = rawMessage.trim()
+  if (!value) {
+    return
+  }
+  guidedProfile.value[step.key] = value as never
+}
+
 const updateGuidedProfileFromMessage = (rawMessage: string) => {
   const text = rawMessage.toLowerCase()
   const profile = guidedProfile.value
 
-  if (!profile.category && includesAny(text, ['手机', 'phone', 'smartphone', '苹果', '安卓'])) {
-    profile.category = '手机'
+  if (!profile.category) {
+    const category = detectCategoryFromText(rawMessage)
+    if (category) {
+      profile.category = category
+    }
   }
 
   const budget = parseBudgetFromText(text)
@@ -608,28 +762,20 @@ const updateGuidedProfileFromMessage = (rawMessage: string) => {
     profile.budget = budget
   }
 
-  if (!profile.usage && includesAny(text, ['拍照', '摄影', '游戏', '办公', '通勤', '商务', '老人', '长辈', '日常'])) {
+  if (!profile.usage && includesAny(text, ['拍照', '摄影', '游戏', '办公', '通勤', '商务', '老人', '长辈', '日常', '送礼', '学习', '家用', '运动'])) {
     profile.usage = rawMessage.trim()
   }
 
-  if (!profile.brand && includesAny(text, ['华为', '荣耀', '小米', '红米', 'oppo', 'vivo', '苹果', 'iphone', '三星', '都可以', '无所谓'])) {
+  if (!profile.brand && includesAny(text, ['华为', '荣耀', '小米', '红米', 'oppo', 'vivo', '苹果', 'iphone', '三星', '联想', '戴尔', '惠普', '华硕', '耐克', '阿迪', '都可以', '无所谓'])) {
     profile.brand = rawMessage.trim()
   }
 
-  if (!profile.camera && includesAny(text, ['拍照', '夜景', '人像', '视频', '防抖', '镜头'])) {
-    profile.camera = rawMessage.trim()
+  if (!profile.detailA && includesAny(text, ['降噪', '音质', '通话', '续航', '肤质', '干皮', '油皮', '敏感肌', '保湿', '修护', '控油', '抗老', '性能', '轻薄', '口味', '成分', '适口性'])) {
+    profile.detailA = rawMessage.trim()
   }
 
-  if (!profile.battery && includesAny(text, ['续航', '电池', '快充', '充电', '一天一充', '5000'])) {
-    profile.battery = rawMessage.trim()
-  }
-
-  if (!profile.performance && includesAny(text, ['游戏', '性能', '流畅', '发热', '处理器', '芯片'])) {
-    profile.performance = rawMessage.trim()
-  }
-
-  if (!profile.storage && includesAny(text, ['128', '256', '512', '1tb', '存储', '内存'])) {
-    profile.storage = rawMessage.trim()
+  if (!profile.detailB && includesAny(text, ['佩戴', '入耳', '头戴', '舒适', '重量', '接口', '尺寸', '便携', '限制', '避开', '过敏', '独立包装', '透气', '外出'])) {
+    profile.detailB = rawMessage.trim()
   }
 }
 
@@ -648,16 +794,15 @@ const isGuidedStepDone = (key: keyof GuidedRequirementProfile) => {
 const getGuidedCompletionScore = () => {
   const profile = guidedProfile.value
   const coreFilled = [
+    Boolean(profile.category) || guidedSkippedKeys.value.includes('category'),
     profile.budget !== null || guidedSkippedKeys.value.includes('budget'),
     Boolean(profile.usage) || guidedSkippedKeys.value.includes('usage'),
-    Boolean(profile.brand) || guidedSkippedKeys.value.includes('brand'),
-    Boolean(profile.storage) || guidedSkippedKeys.value.includes('storage')
+    Boolean(profile.brand) || guidedSkippedKeys.value.includes('brand')
   ].filter(Boolean).length
 
   const extraFilled = [
-    Boolean(profile.camera) || guidedSkippedKeys.value.includes('camera'),
-    Boolean(profile.battery) || guidedSkippedKeys.value.includes('battery'),
-    Boolean(profile.performance) || guidedSkippedKeys.value.includes('performance')
+    Boolean(profile.detailA) || guidedSkippedKeys.value.includes('detailA'),
+    Boolean(profile.detailB) || guidedSkippedKeys.value.includes('detailB')
   ].filter(Boolean).length
 
   return { coreFilled, extraFilled }
@@ -686,7 +831,7 @@ const shouldFinalizeGuidedFlow = (latestMessage: string) => {
 }
 
 const getNextGuidedStep = (): ({ key: keyof GuidedRequirementProfile, question: string, index: number }) | null => {
-  for (const [index, step] of PHONE_GUIDED_STEPS.entries()) {
+  for (const [index, step] of getGuidedSteps().entries()) {
     if (!isGuidedStepDone(step.key)) {
       return { key: step.key, question: step.question, index }
     }
@@ -694,32 +839,56 @@ const getNextGuidedStep = (): ({ key: keyof GuidedRequirementProfile, question: 
   return null
 }
 
-const shouldEnterPhoneGuidedFlow = (message: string) => {
+const shouldEnterGuidedFlow = (userMessage: string) => {
   if (!guidedModeEnabled.value) {
     return false
   }
-  const normalized = message.toLowerCase()
-  return includesAny(normalized, ['手机', 'phone', 'smartphone', 'iphone', '安卓'])
+
+  const text = userMessage.trim().toLowerCase()
+  if (!text) {
+    return false
+  }
+
+  if (wantsDirectRecommendation(text)) {
+    return false
+  }
+
+  const hasCategory = Boolean(detectCategoryFromText(userMessage))
+  const hasBudget = parseBudgetFromText(userMessage) !== null
+  const hasUsage = includesAny(text, ['学习', '办公', '通勤', '游戏', '送礼', '家用', '运动', '外出'])
+  const hasBrand = includesAny(text, ['华为', '荣耀', '小米', '苹果', '索尼', '联想', '戴尔', '惠普', '华硕', '都可以'])
+  const signalCount = [hasCategory, hasBudget, hasUsage, hasBrand].filter(Boolean).length
+
+  if (hasCategory && (!hasBudget || !hasUsage)) {
+    return true
+  }
+
+  if (hasDirectCommodityDemand(text) && signalCount <= 2) {
+    return true
+  }
+
+  return signalCount <= 1
 }
 
 const buildGuidedPrompt = (userMessage: string) => {
   const profile = guidedProfile.value
+  const strategy = getGuideStrategy(profile.category)
   const budgetText = profile.budget ? `${profile.budget} 元` : (guidedSkippedKeys.value.includes('budget') ? '预算不设限' : '未明确')
   const asLabel = (key: keyof GuidedRequirementProfile, value: string) => value || (guidedSkippedKeys.value.includes(key) ? '不限定' : '未明确')
 
   return [
-    '你是资深手机导购专家，请基于以下信息给出最合理推荐。',
+    '你是资深电商导购专家，请基于以下信息给出最合理推荐。',
     '如果用户条件不完整，请按常见主流偏好补齐合理默认值，并说明你如何取舍。',
     `用户原始需求：${userMessage}`,
-    `品类：${profile.category || '手机'}`,
+    `品类：${asLabel('category', profile.category)}`,
     `预算：${budgetText}`,
     `使用场景：${asLabel('usage', profile.usage)}`,
     `品牌偏好：${asLabel('brand', profile.brand)}`,
-    `拍照要求：${asLabel('camera', profile.camera)}`,
-    `续航/快充：${asLabel('battery', profile.battery)}`,
-    `性能要求：${asLabel('performance', profile.performance)}`,
-    `存储要求：${asLabel('storage', profile.storage)}`,
-    '请输出 3 款主推和 2 款备选，且优先满足预算和关键刚需。'
+    `${strategy.detailALabel}：${asLabel('detailA', profile.detailA)}`,
+    `${strategy.detailBLabel}：${asLabel('detailB', profile.detailB)}`,
+    '请输出 3 款主推和 2 款备选，优先满足预算和关键刚需。',
+    '如果该品类存在自然成立的搭配链路，再额外给出 1 到 2 个合理搭配推荐。',
+    '搭配推荐必须满足以下条件：服务主商品使用场景、不是同类替代品、不是硬凑、理由要具体。'
   ].join('\n')
 }
 
@@ -728,7 +897,7 @@ const pushAssistantQuestion = (question: string) => {
     role: 'assistant',
     content: question,
     timestamp: new Date().toISOString(),
-    detectedIntent: '手机导购需求采集中',
+    detectedIntent: `${guidedProfile.value.category || '商品'}导购需求采集中`,
     budgetSummary: guidedProfile.value.budget ? `预算约 ${formatCurrency(guidedProfile.value.budget)}` : '预算待确认'
   })
   persistCurrentSession()
@@ -740,11 +909,17 @@ const compactAssistantDetail = (content: string) => {
     return '已为你整理好推荐结果，请直接查看下方商品卡片。'
   }
 
-  if (text.length <= 220) {
+  if (text.length <= 260) {
     return text
   }
 
-  return `${text.slice(0, 220).trim()}...`
+  const sentenceMatches = text.match(/[^。！？!?；;]+[。！？!?；;]?/g) ?? []
+  const conciseSentences = sentenceMatches
+    .map(item => item.trim())
+    .filter(Boolean)
+    .slice(0, 4)
+
+  return conciseSentences.length ? conciseSentences.join(' ') : text
 }
 
 const briefAssistantSentence = (msg: Message) => {
@@ -762,31 +937,24 @@ const briefAssistantSentence = (msg: Message) => {
   return '已根据你的需求整理建议，请查看下方内容。'
 }
 
+const relatedDeckTitle = (message: Message) => {
+  return `${message.detectedIntent || '本轮推荐'}合理搭配`
+}
+
+const relatedDeckSubtitle = (message: Message) => {
+  const mainGoods = firstRecommendedGoods(message)
+  if (!mainGoods) {
+    return '这些商品是围绕主推结果补齐使用链路的补充选择。'
+  }
+  return `围绕 ${mainGoods.name} 补齐使用链路，只展示逻辑成立的补充商品。`
+}
+
 const firstRecommendedGoods = (message: Message) => message.goodsList?.[0]
 
 const recommendationBadge = (index: number) => {
   if (index === 0) return 'TOP 1'
   if (index === 1) return 'TOP 2'
   return `TOP ${index + 1}`
-}
-
-const recommendationRole = (index: number) => {
-  if (index === 0) return '主推款'
-  if (index === 1) return '稳妥备选'
-  return '延展选择'
-}
-
-const recommendationHeadline = (goods: Goods, index: number) => {
-  if (!goods.withinBudget && index === 0) {
-    return '核心需求接近，但价格高于当前预算'
-  }
-  if (goods.withinBudget && index === 0) {
-    return '当前场景下最值得优先比较的一款'
-  }
-  if (goods.withinBudget) {
-    return '预算友好，适合和主推款横向对比'
-  }
-  return '可作为更高配置的替代方案'
 }
 
 const formatSalesLabel = (salesCount: number) => {
@@ -796,56 +964,69 @@ const formatSalesLabel = (salesCount: number) => {
   return `成交 ${salesCount} 件`
 }
 
-const recommendationSupport = (goods: Goods, index: number) => {
-  if (goods.salesCount > 0) {
-    return `热度参考 ${goods.salesCount} 件`
+const formatReasonLines = (goods: Goods) => {
+  const raw = (goods.reason || '').trim()
+  if (!raw) {
+    return []
   }
-  return index === 0 ? '优先结合场景匹配' : '适合作为备选比较'
+
+  return raw
+    .split(/\n|；|;|。/)
+    .map(item => item.trim())
+    .filter(Boolean)
+    .slice(0, 3)
 }
 
-const goodsDescription = (goods: Goods) => {
-  return productCardDescription({
-    name: goods.name,
-    description: goods.desc,
-    tags: goods.tags,
-    sellingPoints: goods.reason
-  }, goods.reason || '查看商品详情')
+const sanitizeGoodsTags = (tags?: string[]) => {
+  return (tags ?? [])
+    .map(tag => (tag || '').trim())
+    .filter(Boolean)
+    .filter(tag => !HIDDEN_GOODS_TAGS.has(tag.toLowerCase()))
+    .slice(0, 4)
 }
 
 const analysisElapsedLabel = computed(() => `已分析 ${analysisElapsedSeconds.value}s`)
-
-const latestTraceSteps = computed(() => {
-  if (!latestAssistantMessage.value) {
-    return []
-  }
-  return toolTraceSteps(latestAssistantMessage.value)
+const analysisProgressSteps = computed(() => {
+  return analysisLiveSteps.value.length ? analysisLiveSteps.value : DEFAULT_ANALYSIS_PROGRESS_STEPS
 })
-
-const toolTraceSteps = (message: Message) => {
-  const trace = (message.insights ?? []).find(insight => /tool|轨迹/i.test(insight.label))
-  if (!trace?.value) {
-    return []
-  }
-  return trace.value
-    .split('|')
-    .map(item => item.trim())
-    .filter(Boolean)
-}
 
 const startAnalysisVisualization = () => {
   analysisVisible.value = true
   analysisStartedAt = Date.now()
   analysisStepIndex.value = 0
   analysisElapsedSeconds.value = 0
+  analysisLiveSteps.value = [...DEFAULT_ANALYSIS_PROGRESS_STEPS]
   if (analysisTimer !== null) {
     window.clearInterval(analysisTimer)
   }
   analysisTimer = window.setInterval(() => {
     analysisElapsedSeconds.value += 1
-    if (analysisElapsedSeconds.value % 2 === 0 && analysisStepIndex.value < analysisProgressSteps.length - 1) {
+    if (analysisElapsedSeconds.value % 2 === 0 && analysisStepIndex.value < analysisProgressSteps.value.length - 1) {
       analysisStepIndex.value += 1
     }
   }, 1000)
+}
+
+const syncAnalysisProgress = (progress: ChatStreamProgress) => {
+  const step = (progress.step || '').trim()
+  if (!step) {
+    return
+  }
+
+  if (!analysisLiveSteps.value.includes(step)) {
+    analysisLiveSteps.value.push(step)
+  }
+
+  if (progress.total > 0 && analysisLiveSteps.value.length < progress.total) {
+    while (analysisLiveSteps.value.length < progress.total) {
+      analysisLiveSteps.value.push(`处理中步骤 ${analysisLiveSteps.value.length + 1}`)
+    }
+  }
+
+  const targetIndex = progress.index > 0 ? progress.index - 1 : analysisLiveSteps.value.indexOf(step)
+  if (targetIndex >= 0) {
+    analysisStepIndex.value = Math.max(analysisStepIndex.value, Math.min(targetIndex, analysisLiveSteps.value.length - 1))
+  }
 }
 
 const sleep = (ms: number) => new Promise<void>(resolve => window.setTimeout(resolve, ms))
@@ -857,7 +1038,7 @@ const stopAnalysisVisualization = async () => {
     await sleep(minVisibleMs - elapsedMs)
   }
 
-  analysisStepIndex.value = analysisProgressSteps.length - 1
+  analysisStepIndex.value = analysisProgressSteps.value.length - 1
   await sleep(320)
 
   if (analysisTimer !== null) {
@@ -866,20 +1047,8 @@ const stopAnalysisVisualization = async () => {
   }
   analysisStepIndex.value = 0
   analysisElapsedSeconds.value = 0
+  analysisLiveSteps.value = []
   analysisVisible.value = false
-}
-
-const fallbackReasonText = (message: Message) => {
-  if (!message.fallback) {
-    return ''
-  }
-
-  const reasonInsight = (message.insights ?? []).find(insight => insight.label === '兜底原因')
-  if (reasonInsight?.value) {
-    return reasonInsight.value
-  }
-
-  return '当前实时模型请求失败，已切换为规则兜底建议。'
 }
 
 const usePrompt = (prompt: string) => {
@@ -905,8 +1074,10 @@ const syncPromptFromRoute = () => {
 
 const validateActiveUser = async () => {
   if (!currentUser.value) {
-    useDemoAdvisor.value = true
-    return true
+    useDemoAdvisor.value = false
+    noticeType.value = 'error'
+    notice.value = '当前未登录，状态为离线。请先登录或注册后再进行实时导购。'
+    return false
   }
 
   try {
@@ -936,6 +1107,26 @@ const persistCurrentSession = () => {
   refreshSessionList()
 }
 
+const ensureAiOpeningMessage = () => {
+  if (!activeSessionId.value) {
+    return
+  }
+
+  const hasAnyMessage = messageList.value.length > 0
+  if (hasAnyMessage) {
+    return
+  }
+
+  messageList.value.push({
+    role: 'assistant',
+    content: '你好呀，我是小选。我们一步一步来，我先了解你的需求再精准推荐。你这次想买什么品类？',
+    timestamp: new Date().toISOString(),
+    detectedIntent: '需求采集中',
+    budgetSummary: '预算待确认'
+  })
+  persistCurrentSession()
+}
+
 const resetGuidedFlow = () => {
   guidedActive.value = false
   guidedStep.value = 0
@@ -946,10 +1137,8 @@ const resetGuidedFlow = () => {
     budget: null,
     usage: '',
     brand: '',
-    camera: '',
-    battery: '',
-    performance: '',
-    storage: ''
+    detailA: '',
+    detailB: ''
   }
 }
 
@@ -981,11 +1170,19 @@ const ensureActiveSession = () => {
 }
 
 const startNewConversation = () => {
+  if (!currentUser.value) {
+    noticeType.value = 'error'
+    notice.value = '请先登录或注册后再新建导购对话。'
+    void router.push('/login')
+    return
+  }
+
   const session = createChatSession(advisorUserId.value)
   refreshSessionList()
   resetGuidedFlow()
   activeSessionId.value = session.id
   messageList.value = []
+  ensureAiOpeningMessage()
   inputValue.value = ''
   noticeType.value = 'success'
   notice.value = '已新建对话，你可以开始新的需求。'
@@ -1052,12 +1249,12 @@ const mapProducts = (products: ProductDto[]): Goods[] => {
     id: item.id,
     name: item.name,
     price: item.price,
-    desc: productCardDescription(item, item.sellingPoints || item.specs || item.policy || '查看商品详情'),
+    desc: item.description || item.sellingPoints || item.specs || item.policy || '查看商品详情',
     image: item.imageUrl || `https://picsum.photos/seed/product-${index + 1}/480/320`,
     reason: item.sellingPoints || item.specs || item.policy || '来自商品库样本',
     salesCount: 0,
     withinBudget: true,
-    tags: item.tags ? item.tags.split(/[,，]/).map(tag => tag.trim()).filter(Boolean).slice(0, 4) : []
+    tags: sanitizeGoodsTags(item.tags ? item.tags.split(/[,，]/).map(tag => tag.trim()) : [])
   }))
 }
 
@@ -1065,17 +1262,12 @@ const mapRecommendation = (item: ChatRecommendationDto): Goods => ({
   id: item.productId,
   name: item.name,
   price: item.price,
-  desc: productCardDescription({
-    name: item.name,
-    description: item.description,
-    tags: item.tags,
-    sellingPoints: item.reason
-  }, item.reason || '查看商品详情'),
+  desc: item.description || item.reason || '查看商品详情',
   image: item.imageUrl || `https://picsum.photos/seed/${item.productId}/480/320`,
   reason: item.reason,
   salesCount: item.salesCount,
   withinBudget: item.withinBudget,
-  tags: item.tags ?? []
+  tags: sanitizeGoodsTags(item.tags ?? [])
 })
 
 type ProductPreview = {
@@ -1267,9 +1459,15 @@ const maybeAutoSendPrompt = async () => {
 
 const scrollToBottom = () => {
   nextTick(() => {
-    if (chatRef.value) {
-      chatRef.value.scrollTop = chatRef.value.scrollHeight
+    if (scrollFrameId !== null) {
+      window.cancelAnimationFrame(scrollFrameId)
     }
+    scrollFrameId = window.requestAnimationFrame(() => {
+      if (chatRef.value) {
+        chatRef.value.scrollTop = chatRef.value.scrollHeight
+      }
+      scrollFrameId = null
+    })
   })
 }
 
@@ -1285,6 +1483,12 @@ const focusLatestConversation = () => {
 const sendMessage = async () => {
   if (!inputValue.value.trim()) return
   if (sending.value) return
+  if (!currentUser.value) {
+    noticeType.value = 'error'
+    notice.value = '当前未登录，无法发送导购需求。请先登录或注册账号。'
+    void router.push('/login')
+    return
+  }
 
   ensureActiveSession()
 
@@ -1300,17 +1504,24 @@ const sendMessage = async () => {
   persistCurrentSession()
   scrollToBottom()
 
-  const enteringGuidedFlow = !guidedActive.value && shouldEnterPhoneGuidedFlow(inputVal)
+  const currentCategory = detectCategoryFromText(inputVal)
+  if (currentCategory && guidedProfile.value.category && currentCategory !== guidedProfile.value.category) {
+    resetGuidedFlow()
+  }
+
+  const enteringGuidedFlow = !guidedActive.value && shouldEnterGuidedFlow(inputVal)
   if (enteringGuidedFlow) {
     guidedActive.value = true
-    guidedProfile.value.category = '手机'
-    guidedStep.value = 0
+    guidedQuestionCount.value = 0
+    const detectedCategory = detectCategoryFromText(inputVal)
+    if (detectedCategory) {
+      guidedProfile.value.category = detectedCategory
+    }
   }
 
   if (guidedActive.value) {
-    updateGuidedProfileFromMessage(inputVal)
+    const currentStep = getGuidedSteps()[guidedStep.value]
 
-    const currentStep = PHONE_GUIDED_STEPS[guidedStep.value]
     if (currentStep && isFuzzyUnknownAnswer(inputVal)) {
       markGuidedStepSkipped(currentStep.key)
       if (currentStep.key === 'brand' && !guidedProfile.value.brand) {
@@ -1319,7 +1530,13 @@ const sendMessage = async () => {
       if (currentStep.key === 'usage' && !guidedProfile.value.usage) {
         guidedProfile.value.usage = '日常综合使用'
       }
+      if (currentStep.key === 'category' && !guidedProfile.value.category) {
+        guidedProfile.value.category = '商品'
+      }
     }
+
+    fillCurrentGuidedAnswer(currentStep, inputVal)
+    updateGuidedProfileFromMessage(inputVal)
 
     const pendingStep = getNextGuidedStep()
     if (pendingStep && !shouldFinalizeGuidedFlow(inputVal)) {
@@ -1337,28 +1554,62 @@ const sendMessage = async () => {
     ? buildGuidedPrompt(inputVal)
     : inputVal
 
+  const draftAssistantMessage: Message = {
+    role: 'assistant',
+    content: '我在理解你的需求，马上开始一步步确认。',
+    timestamp: new Date().toISOString()
+  }
+  messageList.value.push(draftAssistantMessage)
+  scrollToBottom()
+
   try {
-    const chatRes = await api.sendChat(advisorUserId.value, requestMessage)
+    let receivedFirstDelta = false
+    let streamedFinalPayload = null as Awaited<ReturnType<typeof api.sendChatStream>>
+    
+    // 根据模式选择API
+    const chatRes = adviceMode.value === 'quick'
+      ? await api.sendChatQuick(advisorUserId.value, requestMessage, activeSessionId.value)
+      : await api.sendChatStream(advisorUserId.value, requestMessage, activeSessionId.value, {
+          onStart: () => {
+            // keep placeholder visible while waiting first delta
+          },
+          onProgress: (progress) => {
+            syncAnalysisProgress(progress)
+          },
+          onDelta: (chunk) => {
+            if (!receivedFirstDelta) {
+              draftAssistantMessage.content = chunk
+              receivedFirstDelta = true
+            } else {
+              draftAssistantMessage.content += chunk
+            }
+            scrollToBottom()
+          },
+          onFinal: (payload) => {
+            streamedFinalPayload = payload
+          }
+        })
+
+    const finalPayload = streamedFinalPayload || chatRes
+    if (!finalPayload) {
+      throw new Error('stream_final_payload_missing')
+    }
+
     backendReachable.value = true
-    const goodsList = (chatRes.recommendations ?? []).map(mapRecommendation)
-    const relatedGoods = (chatRes.relatedRecommendations ?? []).map(mapRecommendation)
-    messageList.value.push({
-      role: 'assistant',
-      content: chatRes.reply,
-      goodsList,
-      relatedGoods,
-      insights: chatRes.insights ?? [],
-      timestamp: chatRes.timestamp,
-      budgetSummary: chatRes.budgetSummary,
-      detectedIntent: chatRes.detectedIntent,
-      fallback: chatRes.fallback
-    })
+    const goodsList = (finalPayload.recommendations ?? []).map(mapRecommendation)
+    const relatedGoods = (finalPayload.relatedRecommendations ?? []).map(mapRecommendation)
+    draftAssistantMessage.content = finalPayload.reply || draftAssistantMessage.content || '已为你整理好推荐结果，请查看下方商品卡片。'
+    draftAssistantMessage.goodsList = goodsList
+    draftAssistantMessage.relatedGoods = relatedGoods
+    draftAssistantMessage.insights = finalPayload.insights ?? []
+    draftAssistantMessage.timestamp = finalPayload.timestamp
+    draftAssistantMessage.budgetSummary = finalPayload.budgetSummary
+    draftAssistantMessage.detectedIntent = finalPayload.detectedIntent
+    draftAssistantMessage.fallback = finalPayload.fallback
     persistCurrentSession()
 
     await Promise.all(goodsList.slice(0, 3).map(item => recordView(item, 'chat-recommendation')))
-    if (guidedActive.value) {
-      resetGuidedFlow()
-    }
+    resetGuidedFlow()
   } catch {
     const validUser = await validateActiveUser()
     if (!validUser) {
@@ -1367,14 +1618,26 @@ const sendMessage = async () => {
     }
 
     backendReachable.value = false
+    const draftIndex = messageList.value.lastIndexOf(draftAssistantMessage)
+    if (draftIndex >= 0 && !draftAssistantMessage.content.trim()) {
+      messageList.value.splice(draftIndex, 1)
+    }
     noticeType.value = 'error'
     notice.value = '当前 AI 请求超时或失败，已切换到本地推荐模式。'
     const fallbackPack = selectFallbackPack(inputVal, featuredGoods.value)
+    const fallbackRecommendations = fallbackPack.recommendations.map(goods => ({
+      ...goods,
+      tags: sanitizeGoodsTags(goods.tags)
+    }))
+    const fallbackRelatedGoods = fallbackPack.relatedGoods.map(goods => ({
+      ...goods,
+      tags: sanitizeGoodsTags(goods.tags)
+    }))
     messageList.value.push({
       role: 'assistant',
-      content: '需求速览：本次 AI 导购请求超时或失败，我已切到本地真实商品库继续给你推荐。你现在看到的商品都能直接走详情、加购和下单链路。',
-      goodsList: fallbackPack.recommendations,
-      relatedGoods: fallbackPack.relatedGoods,
+      content: '需求速览：本次 AI 导购请求超时或失败，我已切到本地真实商品库继续给你推荐。你现在看到的是本轮最值得优先比较的商品。',
+      goodsList: fallbackRecommendations,
+      relatedGoods: fallbackRelatedGoods,
       insights: [
         { label: 'AI模式', value: '规则兜底' },
         { label: '兜底原因', value: 'AI 导购请求超时或失败，当前已切到本地推荐模式。' },
@@ -1386,9 +1649,7 @@ const sendMessage = async () => {
       fallback: true
     })
     persistCurrentSession()
-    if (guidedActive.value) {
-      resetGuidedFlow()
-    }
+    resetGuidedFlow()
   } finally {
     await stopAnalysisVisualization()
     sending.value = false
@@ -1405,13 +1666,10 @@ const initializeChat = async () => {
     return
   }
 
-  if (!currentUser.value) {
-    useDemoAdvisor.value = true
-    noticeType.value = 'success'
-    notice.value = `当前以${advisorUserName.value}模式提供 AI 导购，无需登录也能先问商品。`
-  }
+  useDemoAdvisor.value = false
 
   await Promise.allSettled([loadFeaturedProducts(), loadHistory()])
+  ensureAiOpeningMessage()
   await loadAiProviderOverview()
   focusLatestConversation()
   await maybeAutoSendPrompt()
@@ -1419,6 +1677,17 @@ const initializeChat = async () => {
 
 onMounted(() => {
   void initializeChat()
+})
+
+onBeforeUnmount(() => {
+  if (analysisTimer !== null) {
+    window.clearInterval(analysisTimer)
+    analysisTimer = null
+  }
+  if (scrollFrameId !== null) {
+    window.cancelAnimationFrame(scrollFrameId)
+    scrollFrameId = null
+  }
 })
 
 watch(() => route.query.session, (sessionId) => {
@@ -1439,9 +1708,11 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 .shopping-shell {
   width: 100%;
   max-width: 100%;
-  padding: 0 20px 80px;
+  padding: 0 20px;
   margin: 0 auto;
-  display: grid;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
   gap: 14px;
   box-sizing: border-box;
 }
@@ -1711,9 +1982,11 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
   border-radius: 28px;
   box-shadow: var(--shadow-lg);
   backdrop-filter: blur(14px);
-}
-
-.chat-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 400px;
+  gap: 12px;
   padding: 18px;
 }
 
@@ -1808,8 +2081,8 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 }
 
 .trace-pill {
-  font-size: 12px;
-  padding: 6px 10px;
+  font-size: 11px;
+  padding: 4px 8px;
   border-radius: 999px;
   background: rgba(22, 154, 127, 0.1);
   color: #1f5d50;
@@ -1927,6 +2200,35 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
   font-size: 12px;
 }
 
+.reason-panel {
+  display: grid;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: linear-gradient(180deg, #fff8ee 0%, #fffdf7 100%);
+  border: 1px solid #efd9bb;
+}
+
+.reason-title {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: #9a4f10;
+}
+
+.reason-list {
+  margin: 0;
+  padding-left: 16px;
+  display: grid;
+  gap: 3px;
+}
+
+.reason-list li {
+  color: #6b4f34;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .status-stack {
   display: grid;
   gap: 8px;
@@ -1940,9 +2242,9 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 .mini-insight {
   display: inline-flex;
   align-items: center;
-  padding: 7px 10px;
+  padding: 5px 8px;
   border-radius: 999px;
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 700;
 }
 
@@ -2001,10 +2303,9 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 }
 
 .chat-container {
-  height: calc(100vh - 280px);
-  min-height: 520px;
-  margin-top: 16px;
-  padding: 8px 6px 8px 0;
+  flex: 1;
+  min-height: 300px;
+  padding: 8px 6px 12px 0;
   overflow-y: auto;
   scroll-behavior: smooth;
 }
@@ -2013,7 +2314,8 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
   display: flex;
   gap: 12px;
   margin-bottom: 20px;
-  max-width: 86%;
+  width: fit-content;
+  max-width: min(86%, 78ch);
 }
 
 .message-item.user {
@@ -2040,9 +2342,11 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 }
 
 .content {
-  flex: 1;
+  flex: 0 1 auto;
   display: grid;
   gap: 8px;
+  width: fit-content;
+  max-width: min(100%, 72ch);
 }
 
 .meta-row {
@@ -2050,6 +2354,7 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
   justify-content: space-between;
   gap: 12px;
   align-items: center;
+  width: min(100%, 72ch);
 }
 
 .speaker,
@@ -2059,6 +2364,9 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 }
 
 .text {
+  width: fit-content;
+  max-width: 100%;
+  min-width: min(14ch, 100%);
   padding: 14px 16px;
   border-radius: 20px;
   line-height: 1.72;
@@ -2068,9 +2376,12 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 
 .assistant-text {
   display: grid;
-  gap: 8px;
-  padding: 14px 16px;
-  border-radius: 20px;
+  gap: 6px;
+  width: fit-content;
+  max-width: 100%;
+  min-width: min(18ch, 100%);
+  padding: 12px 14px;
+  border-radius: 16px;
   background: linear-gradient(180deg, #f9f7f1 0%, #fffdfa 100%);
   color: #243340;
   border-top-left-radius: 6px;
@@ -2082,11 +2393,11 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 
 .text-block {
   display: grid;
-  grid-template-columns: 22px 1fr;
-  gap: 8px;
+  grid-template-columns: 18px 1fr;
+  gap: 6px;
   align-items: start;
-  padding: 8px 10px;
-  border-radius: 14px;
+  padding: 6px 8px;
+  border-radius: 10px;
 }
 
 .text-block.normal {
@@ -2095,6 +2406,9 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 
 .text-block.focus {
   background: #fff2df;
+  width: fit-content;
+  max-width: 100%;
+  min-width: min(18ch, 100%);
 }
 
 .text-block.accent {
@@ -2102,12 +2416,13 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 }
 
 .text-emoji {
-  font-size: 16px;
-  line-height: 1.5;
+  font-size: 13px;
+  line-height: 1.45;
 }
 
 .text-line {
-  line-height: 1.72;
+  line-height: 1.62;
+  font-size: 13px;
 }
 
 .text-line :deep(.inline-emphasis) {
@@ -2138,32 +2453,42 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 
 .advisor-brief {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(108px, 1fr));
+  gap: 6px;
 }
 
 .brief-card {
   display: grid;
-  gap: 6px;
-  padding: 12px 14px;
-  border-radius: 18px;
+  gap: 4px;
+  padding: 7px 8px;
+  border-radius: 10px;
   background: linear-gradient(180deg, #fffdfa 0%, #f5f1ea 100%);
   border: 1px solid #eadfce;
 }
 
 .brief-card span {
   color: #7a6f62;
-  font-size: 12px;
+  font-size: 11px;
 }
 
 .brief-card strong {
   color: #273644;
-  line-height: 1.4;
+  line-height: 1.32;
+  font-size: 13px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .brief-card small {
   color: #6f655a;
-  line-height: 1.45;
+  line-height: 1.4;
+  font-size: 11px;
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .brief-card.spotlight {
@@ -2171,10 +2496,37 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
   border-color: #e8c79d;
 }
 
+.result-showcase {
+  display: grid;
+  gap: 8px;
+  padding: 8px;
+  border-radius: 12px;
+  background: linear-gradient(180deg, rgba(255, 252, 246, 0.96) 0%, rgba(245, 250, 248, 0.94) 100%);
+  border: 1px solid #e6d9c8;
+}
+
+.result-showcase-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+}
+
+.result-showcase-head strong {
+  font-size: 12px;
+  color: #1f5d50;
+  letter-spacing: 0.02em;
+}
+
+.result-showcase-head span {
+  font-size: 11px;
+  color: #7a6f62;
+}
+
 .goods-list {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 14px;
+  grid-template-columns: repeat(auto-fit, minmax(188px, 1fr));
+  gap: 10px;
 }
 
 .related-deck {
@@ -2203,15 +2555,15 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 
 .related-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
+  gap: 10px;
 }
 
 .related-card {
   display: grid;
-  gap: 10px;
-  padding: 12px;
-  border-radius: 18px;
+  gap: 8px;
+  padding: 10px;
+  border-radius: 12px;
   border: 1px solid #eadfce;
   background: linear-gradient(180deg, #fffdfa 0%, #f9f3e9 100%);
 }
@@ -2242,21 +2594,25 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 
 .goods-card {
   display: grid;
-  gap: 12px;
-  padding: 14px;
-  border-radius: 20px;
+  gap: 8px;
+  padding: 8px;
+  border-radius: 12px;
   border: 1px solid #eadfce;
   background: linear-gradient(180deg, #ffffff 0%, #fffaf4 100%);
-  box-shadow: 0 14px 26px rgba(54, 45, 28, 0.06);
+  box-shadow: 0 10px 18px rgba(54, 45, 28, 0.05);
 }
 
 .goods-media {
   position: relative;
 }
 
+.goods-media .goods-img {
+  border-radius: 12px;
+}
+
 .goods-floating-meta {
   position: absolute;
-  inset: 12px 12px auto 12px;
+  inset: 8px 8px auto 8px;
   display: flex;
   justify-content: space-between;
   gap: 8px;
@@ -2269,13 +2625,13 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
   display: inline-flex;
   align-items: center;
   border-radius: 999px;
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 700;
 }
 
 .rank-badge,
 .sales-badge {
-  padding: 8px 10px;
+  padding: 5px 8px;
   backdrop-filter: blur(8px);
 }
 
@@ -2301,13 +2657,13 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 }
 
 .goods-role {
-  padding: 6px 10px;
+  padding: 4px 8px;
   background: #edf4f6;
   color: #1d4355;
 }
 
 .goods-fit {
-  padding: 6px 10px;
+  padding: 4px 8px;
   background: #fff3e6;
   color: #a25515;
 }
@@ -2315,23 +2671,23 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 .goods-actions,
 .related-actions {
   display: flex;
-  gap: 10px;
+  gap: 8px;
 }
 
 .reason-block {
   display: grid;
-  gap: 6px;
-  padding: 10px 12px;
-  border-radius: 14px;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: 12px;
   background: #fbf7f0;
   color: #5f564e;
-  font-size: 13px;
-  line-height: 1.5;
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .reason-block strong {
   color: #253443;
-  font-size: 12px;
+  font-size: 11px;
 }
 
 .reason-block p {
@@ -2351,8 +2707,8 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 
 .add-cart-btn,
 .secondary-btn {
-  padding: 10px 0;
-  border-radius: 14px;
+  padding: 8px 0;
+  border-radius: 12px;
   font-weight: 700;
 }
 
@@ -2379,29 +2735,71 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 }
 
 .mini-cart-btn {
-  padding: 9px 12px;
-  border-radius: 12px;
+  padding: 7px 10px;
+  border-radius: 10px;
   background: #1f6f5c;
   color: #fff;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 700;
 }
 
 .mini-ghost-btn {
-  padding: 9px 12px;
-  border-radius: 12px;
-  font-size: 13px;
+  padding: 7px 10px;
+  border-radius: 10px;
+  font-size: 12px;
   font-weight: 700;
 }
 
+.advice-mode-selector {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0;
+}
+
+.advice-mode-selector .mode-label {
+  font-size: 12px;
+  color: #6b7280;
+  font-weight: 500;
+  margin-right: 6px;
+}
+
+.advice-mode-selector .mode-btn {
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid #d1d5db;
+  background: #fff;
+  color: #374151;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 140ms;
+}
+
+.advice-mode-selector .mode-btn:hover {
+  border-color: #1f6f5c;
+  color: #1f6f5c;
+}
+
+.advice-mode-selector .mode-btn.active {
+  background: #1f6f5c;
+  color: #fff;
+  border-color: #1f6f5c;
+}
+
 .input-container {
-  margin-top: 16px;
-  padding: 16px;
+  position: relative;
+  width: 100%;
+  margin-top: 0;
+  padding: 10px;
   display: grid;
-  gap: 12px;
-  border-radius: 20px;
+  gap: 8px;
+  border-radius: 14px;
   border: 1px solid #e7ddd1;
-  background: #fffdf9;
+  background: rgba(255, 253, 249, 0.98);
+  box-shadow: 0 4px 12px rgba(36, 51, 64, 0.08);
+  backdrop-filter: blur(12px);
+  flex-shrink: 0;
 }
 
 .emoji-bar {
@@ -2424,11 +2822,25 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
   gap: 12px;
 }
 
+.input-main-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.input-actions {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .chat-input {
   flex: 1;
-  padding: 12px 16px;
+  min-height: 42px;
+  padding: 10px 14px;
   border: 1px solid #e0d6c7;
-  border-radius: 24px;
+  border-radius: 14px;
   font-size: 14px;
   outline: none;
 }
@@ -2439,10 +2851,18 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 
 .voice-btn,
 .send-btn {
-  padding: 12px 18px;
-  border-radius: 24px;
+  padding: 9px 14px;
+  border-radius: 12px;
   font-size: 14px;
   font-weight: 700;
+}
+
+.voice-btn.compact,
+.send-btn.compact {
+  min-width: 66px;
+  padding: 9px 12px;
+  font-size: 12px;
+  line-height: 1;
 }
 
 .voice-btn {
@@ -2726,6 +3146,7 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
   }
 
   .input-row,
+  .input-main-row,
   .panel-head,
   .chat-header,
   .cart-header,
@@ -2745,6 +3166,22 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
   .message-item,
   .message-item.user {
     max-width: 100%;
+  }
+
+  .input-container {
+    width: calc(100vw - 22px);
+    bottom: 8px;
+    padding: 10px;
+  }
+
+  .input-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
+
+  .cart-bubble-wrapper {
+    right: 10px;
+    bottom: 92px;
   }
 }
 
@@ -2900,6 +3337,8 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 .brief-one-line {
   display: inline-flex;
   align-items: center;
+  width: fit-content;
+  max-width: min(100%, 56ch);
   padding: 8px 12px;
   border-radius: 12px;
   background: #f4efe7;
@@ -2913,6 +3352,8 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 .brief-budget-tag {
   display: inline-flex;
   align-items: center;
+  width: fit-content;
+  max-width: min(100%, 56ch);
   padding: 6px 12px;
   border-radius: 999px;
   font-size: 13px;
@@ -2923,6 +3364,11 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
   background: #edf4f6;
   color: #1d4355;
 }
+
+  .content,
+  .meta-row {
+    max-width: 100%;
+  }
 
 .brief-count-tag {
   background: #dff5ea;
@@ -2937,8 +3383,8 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 /* ── Floating cart bubble ────────────────────────────── */
 .cart-bubble-wrapper {
   position: fixed;
-  bottom: 28px;
-  right: 28px;
+  bottom: 76px;
+  right: 18px;
   z-index: 200;
   display: flex;
   flex-direction: column;
@@ -3000,8 +3446,8 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
 
 /* Cart drawer (floating panel) */
 .cart-drawer {
-  width: 320px;
-  max-height: 70vh;
+  width: min(300px, calc(100vw - 26px));
+  max-height: min(62vh, 520px);
   display: flex;
   flex-direction: column;
   background: rgba(255, 255, 255, 0.97);

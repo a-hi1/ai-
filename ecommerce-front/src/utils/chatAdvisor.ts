@@ -110,7 +110,25 @@ const escapeHtml = (value: string) => value
   .replace(/'/g, '&#39;')
 
 const decorateAssistantLine = (value: string) => {
-  return escapeHtml(value).replace(/(预算|主推款|主推|备选款|备选|搭配加购|加购|需求速览|推荐理由|预算内|预算外替代|实时 AI 导购|规则兜底导购)/g, '<strong class="inline-emphasis">$1</strong>')
+  return escapeHtml(value).replace(/(预算|主推款|主推|备选款|备选|搭配推荐|搭配|加购|需求速览|推荐理由|预算内|预算外替代|实时 AI 导购|规则兜底导购)/g, '<strong class="inline-emphasis">$1</strong>')
+}
+
+const normalizeAssistantLine = (value: string) => {
+  return value
+    .replace(/^#{1,6}\s*/g, '')
+    .replace(/^[-*+]\s+/g, '')
+    .replace(/\*\*/g, '')
+    .replace(/`+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+const normalizeAssistantText = (content: string) => {
+  return (content || '')
+    .replace(/\r/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/[\t ]+/g, ' ')
+    .trim()
 }
 
 const resolveBlockTone = (value: string): AssistantTextBlock['tone'] => {
@@ -132,13 +150,14 @@ const resolveBlockEmoji = (value: string) => {
 }
 
 export const formatAssistantBlocks = (content: string): AssistantTextBlock[] => {
-  const lines = content
+  const normalized = normalizeAssistantText(content)
+  const lines = normalized
     .split(/\n+/)
-    .flatMap(line => line.split(/(?<=[。！？])/))
-    .map(line => line.trim())
+    .flatMap(line => line.split(/(?<=[。！？!?；;])/))
+    .map(line => normalizeAssistantLine(line))
     .filter(Boolean)
 
-  return (lines.length ? lines : [content]).map(line => ({
+  return (lines.length ? lines : [normalizeAssistantLine(normalized)]).filter(Boolean).map(line => ({
     emoji: resolveBlockEmoji(line),
     html: decorateAssistantLine(line),
     tone: resolveBlockTone(line)

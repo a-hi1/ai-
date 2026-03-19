@@ -1,83 +1,51 @@
-# Data Crawler (Python)
+# Data Importer (Python)
 
-轻量、合规的商品抓取与向量化前置标准化工具。
+当前 data-crawler 仅用于本地文件导入，不再执行网络爬取。
 
-## 数据源策略
-- 首选: `https://fakestoreapi.com/products`
-- 备选补量: `https://dummyjson.com/products`
-- 默认抓取 220 条，建议范围 200~300 条。
+## 支持输入
+- `.xlsx`
+- `.csv`
 
-## 目标字段（8字段优先）
-- `title` -> `products.name`
-- `category` -> `products.category`
-- `price` -> `products.price`
-- `specs` -> `products.specs`
-- `selling_points` -> `products.selling_points`
-- `policy` -> `products.policy`
-- `update_time` -> `products.updated_at`
-- `source` + `source_product_id` -> `products.data_source` / `products.source_product_id`
+## 功能
+- 读取本地商品文件并标准化字段。
+- 写入 `products` 表。
+- 同步写入 `product_vectors` 表（单商品单向量块，`chunk_index=0`）。
 
-## 入库模型（修正后）
-- `products`：只放干净商品展示字段，不再塞向量 metadata 文本
-- `product_vectors`：单商品单向量块（chunk_index=0），存 `chunk_text + metadata_json`
-- `chunk_text` 内强制包含：
-	- `product_id=...`
-	- `update_time=...`
-
-## 标准化规则
-- 清洗 HTML / 空白 / 异常符号
-- 卖点摘要长度控制
-- 规格正则提取，提取失败回退为标准款
-- 每条描述文本都带:
-	- `product_id=...`
-	- `update_time=...`
-
-## 运行方式
-1. 安装依赖
+## 安装依赖
 
 ```bash
 pip install -r requirements.txt
 ```
 
-2. 预览抓取结果（不写库）
-
-```bash
-python src/main.py --limit 220 --dry-run
-```
-
-3. 实际入库（清空旧爬虫数据后重建）
-
-```bash
-python src/main.py --limit 220 --replace
-```
-
-运行后会同时写入：
-- `products` N 行
-- `product_vectors` N 行
-
-## XLSX 一键导入
-如果你的商品来源是 Excel (`.xlsx`)，可以直接使用脚本：
+## 导入 XLSX
 
 ```powershell
-./import-xlsx-products.ps1 -XlsxPath ../商品-2026-03-13_19-19.xlsx
+./import-xlsx-products.ps1 -XlsxPath ../商品.xlsx
 ```
 
-可选参数：
+等价命令：
 
-- `-Limit 5000`：限制导入上限
-- `-DryRun`：仅预览，不写入数据库
-
-示例：
-
-```powershell
-./import-xlsx-products.ps1 -XlsxPath ../商品-2026-03-13_19-19.xlsx -DryRun
+```bash
+python src/main.py --input-xlsx ../商品.xlsx --replace-source XLSX
 ```
 
-脚本会自动执行：
-- 按文件字段映射入库
-- 自动商品分类（用于后续归属）
-- 同步写入 `product_vectors`
-- 覆盖旧 `XLSX` 来源数据
+## 导入 CSV
+
+```bash
+python src/main.py --input-csv ../商品.csv --replace-source CSV
+```
+
+## 仅预览
+
+```bash
+python src/main.py --input-xlsx ../商品.xlsx --dry-run
+python src/main.py --input-csv ../商品.csv --dry-run
+```
+
+## 可选参数
+- `--limit`: 限制导入条数，默认 `5000`。
+- `--replace-source`: 先清理指定来源再导入，例如 `XLSX` 或 `CSV`。
+- `--dry-run`: 只解析并输出统计，不写库。
 
 ## 环境变量
 - `DB_HOST` 默认 `localhost`
@@ -86,6 +54,22 @@ python src/main.py --limit 220 --replace
 - `DB_USER` 默认 `postgres`
 - `DB_PASSWORD` 默认 `123456`
 
-## 与 AI 检索链对接
-- 后端统一检索网关接口: `GET /api/retrieval/search`
-- AI 导购查询走检索网关，不直接访问向量存储。
+## 知识库向量化
+
+`src/knowledge-vectorizer.py` 用于将后端知识库文件写入 PostgreSQL + pgvector 向量表。
+
+需要环境变量：
+- `OPENAI_API_KEY`
+
+数据库连接沿用同一套：
+- `DB_HOST`
+- `DB_PORT`
+- `DB_NAME`
+- `DB_USER`
+- `DB_PASSWORD`
+
+示例：
+
+```bash
+python src/knowledge-vectorizer.py --table knowledge_embeddings --replace-source
+```

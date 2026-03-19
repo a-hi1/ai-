@@ -32,6 +32,10 @@
           密码
           <input v-model="password" type="password" placeholder="请输入密码" />
         </label>
+        <label>
+          监控端口
+          <input v-model.number="monitorPort" type="number" min="1" max="65535" placeholder="例如 8081" />
+        </label>
         <p v-if="errorMessage" class="error">{{ errorMessage }}</p>
         <button class="primary" :disabled="submitting" @click="submit">{{ submitting ? '注册中...' : '注册' }}</button>
         <button class="ghost" @click="goLogin">返回登录</button>
@@ -42,14 +46,17 @@
 
 <script setup lang="ts">
 import { ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { useAuth } from '../composables/useAuth'
 
 const router = useRouter()
+const route = useRoute()
 const { register } = useAuth()
 
-const email = ref('')
+const email = ref(String(route.query.account || ''))
 const password = ref('')
+const requestedPort = Number(route.query.monitorPort || route.query.backendPort || 8081)
+const monitorPort = ref(Number.isInteger(requestedPort) && requestedPort > 0 && requestedPort <= 65535 ? requestedPort : 8081)
 const submitting = ref(false)
 const errorMessage = ref('')
 
@@ -58,7 +65,7 @@ const submit = async () => {
   submitting.value = true
   errorMessage.value = ''
   try {
-    await register(email.value, password.value)
+    await register(email.value, password.value, monitorPort.value)
     router.push('/chat')
   } catch {
     errorMessage.value = '注册失败，该邮箱可能已存在。'

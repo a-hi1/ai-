@@ -41,7 +41,7 @@
         </div>
         <div class="hero-metrics">
           <div class="hero-metric">
-            <span>在售精选</span>
+            <span>在售商品</span>
             <strong>{{ animatedProductCount }}</strong>
           </div>
           <div class="hero-metric">
@@ -83,7 +83,7 @@
         </article>
         <article class="showcase-card trend-card">
           <span class="side-kicker">今日热区</span>
-          <strong>{{ featuredGroup?.category.label || '生活精选' }}</strong>
+          <strong>{{ featuredGroup?.category.label || '生活分区' }}</strong>
           <div class="trend-tags">
             <span v-for="tag in featuredGroupTags" :key="tag" class="trend-tag">{{ tag }}</span>
           </div>
@@ -122,7 +122,6 @@
           <img :src="product.imageUrl || fallbackImage(product.id)" :alt="product.name" class="product-image" loading="lazy" decoding="async" />
           <div class="product-copy">
             <strong>{{ product.name }}</strong>
-            <p>{{ productCardDescription(product, group.category.description) }}</p>
           </div>
           <div v-if="splitProductTags(product.tags).length" class="tag-row micro-cloud">
             <span v-for="tag in splitProductTags(product.tags).slice(0, 3)" :key="`${product.id}-${tag}`" class="tag-pill">{{ tag }}</span>
@@ -141,7 +140,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 
-import { groupProductsByCategory, productCardDescription, splitProductTags } from '../catalog'
+import { groupProductsByCategory, splitProductTags } from '../catalog'
 import { api, type ProductDto } from '../services/api'
 
 const CATEGORY_ACCENTS: Record<string, string> = {
@@ -180,7 +179,7 @@ const featuredGroup = computed(() => categoryGroups.value[0] ?? null)
 
 const featuredGroupTags = computed(() => {
   if (!featuredGroup.value) {
-    return ['热卖', '精选', '生活方式']
+    return ['热卖', '高频购买', '生活方式']
   }
 
   return Array.from(new Set(featuredGroup.value.products.flatMap(product => splitProductTags(product.tags)))).slice(0, 4)
@@ -221,7 +220,7 @@ const heroSlides = computed(() => {
     {
       id: 'ai-guide',
       title: '拿不准怎么选时，直接交给 AI 导购',
-      description: '把预算、场景和偏好一次说清楚，系统会先缩小范围，再给出主推、备选和搭配建议。',
+      description: '告诉 AI 你想买什么，系统会通过几个问题缩小范围，再给出主推和备选推荐。',
       primaryLabel: '去 AI 导购',
       primaryTo: '/chat',
       secondaryLabel: '先看商城',
@@ -256,7 +255,7 @@ const bannerStyle = computed(() => ({
 
 const categorySummary = computed(() => {
   const labels = categoryGroups.value.slice(0, 4).map(group => group.category.label)
-  return labels.length ? labels.join(' / ') : '生活用品 / 精选商品 / 食品生鲜 / 电子数码'
+  return labels.length ? labels.join(' / ') : '生活用品 / 食品生鲜 / 电子数码 / 个护美妆'
 })
 
 const categoryAccent = (categoryId: string) => CATEGORY_ACCENTS[categoryId] || 'var(--brand)'

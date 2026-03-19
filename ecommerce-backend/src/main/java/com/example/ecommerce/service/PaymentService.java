@@ -62,8 +62,8 @@ public class PaymentService {
             @Value("${payment.alipay.private-key:}") String alipayPrivateKey,
             @Value("${payment.alipay.public-key:}") String alipayPublicKey,
             @Value("${payment.alipay.sign-enabled:false}") boolean signEnabled,
-            @Value("${payment.alipay.notify-url}") String alipayNotifyUrl,
-            @Value("${payment.alipay.return-url}") String alipayReturnUrl) {
+            @Value("${payment.alipay.notify-url:}") String alipayNotifyUrl,
+            @Value("${payment.alipay.return-url:http://127.0.0.1:5173/payment/callback}") String alipayReturnUrl) {
         this.entityTemplate = entityTemplate;
         this.objectMapper = objectMapper;
         this.httpClient = HttpClient.newHttpClient();

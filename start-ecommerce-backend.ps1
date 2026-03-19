@@ -457,6 +457,20 @@ function Set-BackendEnvironment {
   $env:MONITOR_CONTROL_TOKEN = $monitorControlToken
   $env:MONITOR_RESTART_SCRIPT = $resolvedRestartScriptPath
   $env:MONITOR_COMMAND_SHUTDOWN_DELAY_MS = '1800'
+
+  # Provide Spring monitor.client.* values via environment variables so
+  # names with spaces don't break JVM argument parsing.
+  $env:MONITOR_CLIENT_HOST = $monitorHost
+  $env:MONITOR_CLIENT_PORT = $monitorPort
+  $env:MONITOR_CLIENT_SERVICE_ID = $resolvedServiceId
+  $env:MONITOR_CLIENT_SERVICE_NAME = $monitorServiceName
+  $env:MONITOR_CLIENT_SERVER_TYPE = $monitorServerType
+  $env:MONITOR_CLIENT_ADVERTISE_HOST = $monitorAdvertiseHost
+  $env:MONITOR_CLIENT_ADVERTISE_PORT = $monitorAdvertisePort
+  $env:MONITOR_CLIENT_HEARTBEAT_INTERVAL_MS = $monitorHeartbeatMs
+  $env:MONITOR_CLIENT_CONTROL_TOKEN = $monitorControlToken
+  $env:MONITOR_CLIENT_RESTART_SCRIPT = $resolvedRestartScriptPath
+  $env:MONITOR_CLIENT_COMMAND_SHUTDOWN_DELAY_MS = '1800'
 }
 
 function Build-BackendArtifact {
@@ -465,35 +479,28 @@ function Build-BackendArtifact {
 
   Push-Location $backendDir
   try {
-    mvn -DskipTests clean package
+    # Avoid clean during multi-instance runtime: clean may delete/lock the active jar
+    # and leave no executable artifact for restart.
+    mvn -DskipTests package
     if ($LASTEXITCODE -eq 0) {
       $builtJar = Resolve-BackendJar
-      if (-not $builtJar) {
-        throw 'Build finished, but no executable Spring Boot jar was produced.'
+      if ($builtJar) {
+        return
       }
-      return
+
+      if ($existingExecutableJar) {
+        Write-Warning 'package succeeded but executable jar detection failed; fallback to previous executable jar.'
+        Write-Warning ("Fallback to existing executable jar: {0}" -f $existingExecutableJar.FullName)
+        return
+      }
+
+      throw 'Build finished, but no executable Spring Boot jar was produced.'
     }
 
-    Write-Warning 'clean package failed (likely target jar is locked by a running instance).'
+    Write-Warning 'package failed (likely jar is locked by a running instance).'
 
     if ($existingExecutableJar) {
       Write-Warning ("Fallback to existing executable jar: {0}" -f $existingExecutableJar.FullName)
-      return
-    }
-
-    Write-Warning 'No executable fallback jar exists. Retrying with package only...'
-    mvn -DskipTests package
-    if ($LASTEXITCODE -eq 0) {
-      $fallbackBuiltJar = Resolve-BackendJar
-      if (-not $fallbackBuiltJar) {
-        throw 'package finished, but no executable Spring Boot jar was produced.'
-      }
-      return
-    }
-
-    $existingJar = Resolve-BackendJar
-    if ($existingJar) {
-      Write-Warning ("Build failed, fallback to existing executable jar: {0}" -f $existingJar.FullName)
       return
     }
 
@@ -537,7 +544,11 @@ function Start-BackendProcess {
   }
 
   $process = Start-Process -FilePath 'java' `
-    -ArgumentList @('-Dfile.encoding=UTF-8', '-jar', $jar.FullName) `
+    -ArgumentList @(
+      '-Dfile.encoding=UTF-8',
+      '-jar',
+      $jar.FullName
+    ) `
     -WorkingDirectory $backendDir `
     -RedirectStandardOutput $stdoutLog `
     -RedirectStandardError $stderrLog `

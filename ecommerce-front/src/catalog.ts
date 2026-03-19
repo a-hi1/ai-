@@ -16,6 +16,7 @@ export interface ShopCategoryConfig {
   query: string
   keywords: string[]
   examples: string[]
+  dynamic?: boolean
 }
 
 export interface ShopCategoryGroup<T extends CatalogProductLike> {
@@ -32,15 +33,6 @@ export const SHOP_CATEGORY_CONFIG: ShopCategoryConfig[] = [
     query: '生活用品',
     keywords: ['生活用品', '家居日用', '垃圾袋', '抽纸', '纸巾', '清洁', '洗衣', '湿巾', '厨房', '收纳'],
     examples: ['抽纸', '垃圾袋', '清洁湿巾']
-  },
-  {
-    id: 'featured',
-    label: '精选商品',
-    headline: '综合热卖与高口碑优选',
-    description: '平台综合评分高、销量与评价表现稳定的热门单品。',
-    query: '精选',
-    keywords: ['精选商品', '精选', '热卖', '爆款', '推荐', '优选'],
-    examples: ['平台热卖', '口碑优选', '高性价比']
   },
   {
     id: 'food-fresh',
@@ -100,8 +92,37 @@ export const SHOP_CATEGORY_CONFIG: ShopCategoryConfig[] = [
 
 const CATEGORY_LABEL_TO_ID = new Map<string, string>(SHOP_CATEGORY_CONFIG.map(item => [item.label, item.id]))
 
+const CATEGORY_ALIAS: Record<string, string> = {
+  '服饰鞋包': '服饰',
+  '服装': '服饰',
+  '家居生活': '生活用品',
+  '数码家电': '电子数码',
+  '个护母婴': '个护美妆'
+}
+
+const HIDDEN_CATEGORY_LABELS = new Set(['精选商品', '精选'])
+
+const slugifyCategoryId = (value: string) => {
+  const normalized = normalizeText(value)
+  return normalized
+    .replace(/[^\w\u4e00-\u9fa5\s-]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+}
+
+const normalizeCategoryLabel = (value?: string) => {
+  const text = (value || '').trim()
+  if (!text || HIDDEN_CATEGORY_LABELS.has(text)) {
+    return '其他'
+  }
+
+  const alias = CATEGORY_ALIAS[text]
+  return alias || text
+}
+
 export const splitProductTags = (tags?: string | string[]) => {
-  const hiddenTags = new Set(['crawler', 'escuelajs', 'jsonfile', 'xlsx'])
+  const hiddenTags = new Set(['crawler', 'escuelajs', 'jsonfile', 'xlsx', '精选商品', '精选'])
   if (Array.isArray(tags)) {
     return tags
       .map(tag => tag.trim())
@@ -221,7 +242,7 @@ export const productCardDescription = (product: CatalogProductLike, fallback = '
 }
 
 const categoryMatchScore = (product: CatalogProductLike, category: ShopCategoryConfig) => {
-  if ((product.category || '').trim() === category.label) {
+  if (normalizeCategoryLabel(product.category) === category.label) {
     return 1000
   }
   return 0
@@ -243,7 +264,7 @@ export const matchesCategory = (product: CatalogProductLike, categoryId: string)
 }
 
 export const getPrimaryCategory = (product: CatalogProductLike) => {
-  const directCategory = (product.category || '').trim()
+  const directCategory = normalizeCategoryLabel(product.category)
   if (directCategory) {
     const categoryId = CATEGORY_LABEL_TO_ID.get(directCategory)
     if (categoryId) {
@@ -272,10 +293,46 @@ export const getCategoryProducts = <T extends CatalogProductLike>(products: T[],
 }
 
 export const groupProductsByCategory = <T extends CatalogProductLike>(products: T[]): ShopCategoryGroup<T>[] => {
-  return SHOP_CATEGORY_CONFIG
+  const groupedByKnownCategory = SHOP_CATEGORY_CONFIG
     .map(category => ({
       category,
       products: getCategoryProducts(products, category.id)
     }))
     .filter(group => group.products.length > 0)
+
+  const uncategorized = products.filter(product => !getPrimaryCategory(product))
+  const dynamicMap = new Map<string, { label: string, items: T[] }>()
+  for (const product of uncategorized) {
+    const label = normalizeCategoryLabel(product.category)
+    const key = slugifyCategoryId(label) || 'other'
+    const existing = dynamicMap.get(key)
+    if (existing) {
+      existing.items.push(product)
+      continue
+    }
+    dynamicMap.set(key, { label, items: [product] })
+  }
+
+  const dynamicGroups: ShopCategoryGroup<T>[] = [...dynamicMap.entries()]
+    .map(([idPart, dynamicValue]) => {
+      const label = dynamicValue.label
+      const items = dynamicValue.items
+      const dynamicCategory: ShopCategoryConfig = {
+        id: `dynamic-${idPart}`,
+        label,
+        headline: `${label}分区`,
+        description: `${label}类商品合集，覆盖当前在售货架。`,
+        query: label,
+        keywords: [label],
+        examples: items.slice(0, 3).map(item => item.name),
+        dynamic: true
+      }
+      return {
+        category: dynamicCategory,
+        products: items
+      }
+    })
+    .sort((left, right) => right.products.length - left.products.length)
+
+  return [...groupedByKnownCategory, ...dynamicGroups]
 }

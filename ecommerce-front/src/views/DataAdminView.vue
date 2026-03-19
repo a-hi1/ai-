@@ -62,7 +62,7 @@
             <tbody>
               <tr v-for="product in overview.recentProducts" :key="product.id">
                 <td>{{ product.name }}</td>
-                <td>¥{{ Number(product.price).toFixed(2) }}</td>
+                <td>{{ Number(product.price).toFixed(2) }} 元</td>
                 <td><span class="source-pill" :class="product.dataSource.toLowerCase()">{{ product.dataSource }}</span></td>
                 <td>{{ formatTime(product.createdAt) }}</td>
               </tr>

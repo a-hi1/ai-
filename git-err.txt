@@ -1,3 +1,0 @@
-remote: Permission to xie-yu-yue/shop.git denied to a-hi1.
-fatal: unable to access 'https://github.com/xie-yu-yue/shop.git/': The requested URL returned error: 403
-Pushing to https://github.com/xie-yu-yue/shop.git

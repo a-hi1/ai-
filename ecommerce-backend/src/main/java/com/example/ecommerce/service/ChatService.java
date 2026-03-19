@@ -29,19 +29,24 @@ public class ChatService {
         this.entityTemplate = entityTemplate;
     }
 
-    public Mono<ChatMessage> saveUserMessage(UUID userId, String message) {
-        ChatMessage chatMessage = new ChatMessage(UUID.randomUUID(), userId, "USER", message, Instant.now());
+    public Mono<ChatMessage> saveUserMessage(UUID userId, String sessionId, String message) {
+        ChatMessage chatMessage = new ChatMessage(UUID.randomUUID(), userId, sessionId, "USER", message, Instant.now());
         return entityTemplate.insert(ChatMessage.class).using(chatMessage);
     }
 
-    public Mono<ChatMessage> saveAssistantMessage(UUID userId, String message) {
-        ChatMessage chatMessage = new ChatMessage(UUID.randomUUID(), userId, "ASSISTANT", message, Instant.now());
+    public Mono<ChatMessage> saveAssistantMessage(UUID userId, String sessionId, String message) {
+        ChatMessage chatMessage = new ChatMessage(UUID.randomUUID(), userId, sessionId, "ASSISTANT", message, Instant.now());
         return entityTemplate.insert(ChatMessage.class).using(chatMessage);
     }
 
-    public Mono<ChatAdvicePayload> generateReply(UUID userId, String message) {
+    public Mono<ChatAdvicePayload> generateReply(UUID userId, String message, String sessionId) {
         return skillRegistry.handleSkill(message)
                 .map(reply -> new ChatAdvicePayload(reply, java.util.List.of(), java.util.List.of(), java.util.List.of(), "技能指令", "未设置", false))
-                .switchIfEmpty(aiShoppingAdvisorService.advise(userId, message));
+                .switchIfEmpty(aiShoppingAdvisorService.advise(userId, message, sessionId));
+    }
+
+    public Mono<ChatAdvicePayload> generateQuickReply(UUID userId, String message, String sessionId) {
+        // 快速模式：直接推荐，跳过澄清
+        return aiShoppingAdvisorService.adviseQuick(userId, message, sessionId);
     }
 }

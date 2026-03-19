@@ -10,7 +10,6 @@
         <div class="info-top">
           <span class="detail-label">商品详情</span>
           <h1>{{ product.name }}</h1>
-          <p>{{ detailDescription }}</p>
         </div>
 
         <div class="detail-metrics">
@@ -53,7 +52,6 @@
 
         <div class="price-panel">
           <strong>{{ formatCurrency(product.price) }}</strong>
-          <span>{{ purchaseHintText }}</span>
         </div>
 
         <p v-if="actionMessage" :class="['action-feedback', actionTone]">{{ actionMessage }}</p>
@@ -100,7 +98,6 @@
           <img :src="item.imageUrl || fallbackImage(item.productId)" :alt="item.name" class="related-image" loading="lazy" decoding="async" />
           <div class="related-copy">
             <strong>{{ item.name }}</strong>
-            <p>{{ item.reason }}</p>
           </div>
           <div class="related-foot">
             <span>{{ formatCurrency(item.price) }}</span>
@@ -164,33 +161,9 @@ const cleanSellingPoints = computed(() => sanitizeProductTextField(product.value
 const cleanSpecs = computed(() => sanitizeProductTextField(product.value?.specs))
 const cleanPolicy = computed(() => sanitizeProductTextField(product.value?.policy))
 
-const detailDescription = computed(() => {
-  if (!product.value) {
-    return '商品详情介绍'
-  }
-  const text = sanitizeProductTextField(product.value.description)
-  if (text && !reviewItems.value.length) {
-    return text
-  }
-
-  return cleanSellingPoints.value || cleanSpecs.value || cleanPolicy.value || '商品详情介绍'
-})
-
 const toggleReviews = () => {
   showReviews.value = !showReviews.value
 }
-
-const purchaseHintText = computed(() => {
-  if (!product.value) {
-    return '支持加入购物车与 AI 追问对比'
-  }
-  if (canPersistProduct(product.value.id)) {
-    return '支持加入购物车与 AI 追问对比'
-  }
-  return resolvedProductId.value
-    ? '已自动匹配商城在售商品，可直接加入购物车'
-    : '将自动匹配商城同款后加入购物车'
-})
 
 const resolveCartProductId = async () => {
   if (!product.value) {

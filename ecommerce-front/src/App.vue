@@ -109,7 +109,7 @@ import { useCart } from './composables/useCart'
 import { useAuth } from './composables/useAuth'
 
 const { itemCount } = useCart()
-const { currentUser, logout } = useAuth()
+const { currentUser, logout, syncCurrentUserPresence } = useAuth()
 const route = useRoute()
 const router = useRouter()
 const isCompactHeader = ref(false)
@@ -256,11 +256,23 @@ watch(() => route.fullPath, () => {
   closeAccountMenu()
 })
 
+watch(
+  () => currentUser.value?.email,
+  async (email) => {
+    if (!email) {
+      return
+    }
+    await syncCurrentUserPresence(true)
+  },
+  { immediate: true }
+)
+
 onMounted(() => {
   isHoverCapable.value = window.matchMedia('(hover: hover) and (pointer: fine)').matches
   syncHeaderState()
   window.addEventListener('scroll', scheduleHeaderState, { passive: true })
   document.addEventListener('click', handleDocumentClick)
+  void syncCurrentUserPresence(true)
 })
 
 onBeforeUnmount(() => {
