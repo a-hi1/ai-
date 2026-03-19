@@ -27,7 +27,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$repoRoot = 'D:\zhuomian\workspace'
+$repoRoot = if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) { $PSScriptRoot } else { (Get-Location).Path }
 $backendDir = Join-Path $repoRoot 'ecommerce-backend'
 $backendPom = Join-Path $backendDir 'pom.xml'
 $runtimeFolderName = if ([string]::IsNullOrWhiteSpace($RuntimeName)) { $ServiceName } else { $RuntimeName }
