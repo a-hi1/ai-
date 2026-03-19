@@ -36,6 +36,7 @@ public class AdvisorKnowledgeBaseService {
     private final AtomicReference<List<KnowledgeEntry>> entriesRef = new AtomicReference<>(List.of());
     private final AtomicReference<List<IndexedKnowledgeEntry>> indexedEntriesRef = new AtomicReference<>(List.of());
     private final AtomicReference<Map<String, ClarificationPlan>> clarificationPlansRef = new AtomicReference<>(Map.of());
+    private final AtomicReference<Boolean> loadedFromFileRef = new AtomicReference<>(false);
 
     public AdvisorKnowledgeBaseService(ObjectMapper objectMapper) {
         this.objectMapper = objectMapper;
@@ -51,14 +52,20 @@ public class AdvisorKnowledgeBaseService {
             entriesRef.set(entries);
             indexedEntriesRef.set(buildIndexedEntries(entries));
             clarificationPlansRef.set(loadClarificationPlans(document.questionFlows()));
+            loadedFromFileRef.set(true);
             log.info("Advisor knowledge base loaded: {} entries", entries.size());
         } catch (IOException error) {
             List<KnowledgeEntry> fallback = defaultEntries();
             entriesRef.set(fallback);
             indexedEntriesRef.set(buildIndexedEntries(fallback));
             clarificationPlansRef.set(defaultClarificationPlans());
+            loadedFromFileRef.set(false);
             log.warn("Load advisor knowledge base failed, fallback to defaults: {}", error.toString());
         }
+    }
+
+    public String knowledgeSourceLabel() {
+        return loadedFromFileRef.get() ? "JSON知识库" : "默认兜底模板";
     }
 
     public ClarificationPlan resolveClarificationPlan(String intent, List<KnowledgeSnippet> snippets) {
@@ -164,6 +171,33 @@ public class AdvisorKnowledgeBaseService {
         }
         if (containsAny(searchable, List.of("笔记本", "电脑")) && containsAny(normalizedQuery, List.of("笔记本", "电脑", "学习", "办公", "游戏"))) {
             score += 1.0d;
+        }
+        if (containsAny(searchable, List.of("手机", "影像", "快充")) && containsAny(normalizedQuery, List.of("手机", "拍照", "影像", "续航", "快充"))) {
+            score += 1.0d;
+        }
+        if (containsAny(searchable, List.of("平板", "手写", "办公")) && containsAny(normalizedQuery, List.of("平板", "手写", "学习", "办公", "娱乐"))) {
+            score += 0.95d;
+        }
+        if (containsAny(searchable, List.of("背包", "容量", "分仓")) && containsAny(normalizedQuery, List.of("背包", "通勤", "容量", "分仓", "出差"))) {
+            score += 0.95d;
+        }
+        if (containsAny(searchable, List.of("键盘", "鼠标", "外设")) && containsAny(normalizedQuery, List.of("键盘", "鼠标", "轴体", "DPI", "延迟"))) {
+            score += 0.9d;
+        }
+        if (containsAny(searchable, List.of("个护美妆", "护肤", "成分")) && containsAny(normalizedQuery, List.of("护肤", "美妆", "敏感肌", "成分", "保湿"))) {
+            score += 0.9d;
+        }
+        if (containsAny(searchable, List.of("食品生鲜", "配料", "控糖")) && containsAny(normalizedQuery, List.of("食品", "零食", "饮料", "控糖", "配料"))) {
+            score += 0.9d;
+        }
+        if (containsAny(searchable, List.of("家居家具", "尺寸", "安装")) && containsAny(normalizedQuery, List.of("家居", "家具", "尺寸", "收纳", "安装"))) {
+            score += 0.9d;
+        }
+        if (containsAny(searchable, List.of("鞋靴", "缓震", "脚型")) && containsAny(normalizedQuery, List.of("鞋", "跑鞋", "缓震", "支撑", "脚型"))) {
+            score += 0.9d;
+        }
+        if (containsAny(searchable, List.of("电子数码", "接口", "协议")) && containsAny(normalizedQuery, List.of("数码", "接口", "type-c", "协议", "兼容"))) {
+            score += 0.9d;
         }
         return score;
     }
@@ -329,13 +363,13 @@ public class AdvisorKnowledgeBaseService {
         ClarificationPlan generic = buildGenericPlan();
         defaults.put(GENERIC_PLAN_KEY, generic);
         defaults.put(normalizeIntentKey("耳机"), new ClarificationPlan(
-                "你想看耳机是对的，我先帮你收窄。",
-                "耳机预算你更倾向 200 内、300 到 500，还是 500 以上呢？",
-                "主要是通勤降噪、开会通话，还是运动佩戴呢？",
-            "功能上你更在意降噪强度、音质表现，还是通话清晰度？",
-            "外观上偏向入耳式还是头戴式？颜色有没有偏好？",
-                "你更在意降噪、音质、麦克风清晰度，还是佩戴舒适度？",
-                List.of("budget", "usage", "function", "appearance")));
+                "耳机方向确认了，我会按预算、场景、品牌生态、类型、功能、颜色来做精准筛选。",
+                "预算先定一下：200 内、200 到 500、500 到 1000，还是 1000+？",
+                "主要是通勤降噪、办公开会、运动防汗，还是游戏低延迟？",
+                "功能优先级你可以直接说“降噪>通话>音质”或“音质>舒适度”。",
+                "类型和外观偏好呢？入耳/半入耳/头戴/挂耳，以及颜色偏好。",
+                "品牌上有偏好吗？比如苹果、华为、索尼；如果没有可说品牌不限。",
+                List.of("budget", "scene", "brand", "type", "function", "color")));
         defaults.put(normalizeIntentKey("背包"), new ClarificationPlan(
                 "背包这个方向很好，我先按你的使用方式来筛。",
                 "预算想控制在多少以内？比如 100 到 200、200 到 300、300 以上。",
@@ -460,6 +494,8 @@ public class AdvisorKnowledgeBaseService {
                 case "budget" -> budgetQuestion;
                 case "usage", "scene" -> sceneQuestion;
                 case "function", "feature" -> functionQuestion;
+                case "brand" -> preferenceQuestion;
+                case "type" -> appearanceQuestion;
                 case "appearance", "style", "color" -> appearanceQuestion;
                 default -> preferenceQuestion;
             };

@@ -615,8 +615,7 @@ type ParsedSseEvent = {
 const parseSseEvent = (rawEvent: string): ParsedSseEvent => {
   const lines = rawEvent
     .split(/\r?\n/)
-    .map(line => line.trim())
-    .filter(Boolean)
+    .filter(line => line.trim().length > 0)
 
   let event = 'message'
   const data: string[] = []
@@ -627,7 +626,8 @@ const parseSseEvent = (rawEvent: string): ParsedSseEvent => {
       continue
     }
     if (line.startsWith('data:')) {
-      data.push(line.slice('data:'.length).trim())
+      const payload = line.slice('data:'.length)
+      data.push(payload.startsWith(' ') ? payload.slice(1) : payload)
     }
   }
 

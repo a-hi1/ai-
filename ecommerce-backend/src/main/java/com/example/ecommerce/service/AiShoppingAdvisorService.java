@@ -5,6 +5,8 @@ import java.time.Instant;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -15,14 +17,20 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
+import org.springframework.web.reactive.function.client.WebClient;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.example.ecommerce.config.AiProperties;
 import com.example.ecommerce.dto.ChatAdvicePayload;
 import com.example.ecommerce.dto.ChatInsightResponse;
@@ -53,13 +61,38 @@ public class AiShoppingAdvisorService {
 
     private static final Pattern STRICT_BUDGET_PATTERN = Pattern.compile("(?:预算|价位|控制在|不超过|以内)?\\s*(\\d{2,6})\\s*(?:元|块|rmb|人民币|以内)?", Pattern.CASE_INSENSITIVE);
     private static final int MAX_MAIN_RECOMMENDATIONS = 3;
+    private static final String HEADPHONE_INTENT = "耳机";
     private static final List<String> GENERIC_ACCEPT_WORDS = List.of("都可以", "随便", "无所谓", "你定", "你决定", "没要求", "一般就行");
+    private static final List<String> DIRECT_RECOMMEND_WORDS = List.of("直接推荐", "直接看推荐", "直接给我", "跳过提问", "不用问了", "不想回答", "先给推荐");
     private static final int MIN_REQUIRED_DIMENSIONS_TO_RECOMMEND = 3;
     private static final int MIN_REQUIRED_DIMENSIONS_WITHOUT_AI = 4;
     private static final int MAX_CLARIFICATION_TURNS = 3;
     private static final int MIN_CLARIFICATION_TURNS = 1;
+    private static final int CLARIFICATION_DIMENSION_COOLDOWN = 3;
+    private static final int RECOMMENDATION_PRODUCT_COOLDOWN = 10;
     private static final List<String> FOLLOW_UP_WORDS = List.of("这个", "这个吧", "就这个", "可以", "行", "好", "按你说的", "继续", "嗯", "对", "是的");
     private static final List<String> CATEGORY_SWITCH_SIGNALS = List.of("换个", "改要", "还想要", "另外要", "再要", "还要一个", "我再问", "对了", "顺便问", "帮我也");
+        private static final Map<String, List<String>> BRAND_KEYWORDS = Map.ofEntries(
+            Map.entry("苹果", List.of("苹果", "apple", "airpods")),
+            Map.entry("索尼", List.of("索尼", "sony", "xm")),
+            Map.entry("华为", List.of("华为", "huawei", "freebuds")),
+            Map.entry("小米", List.of("小米", "redmi", "redmibuds")),
+            Map.entry("荣耀", List.of("荣耀", "honor")),
+            Map.entry("JBL", List.of("jbl")),
+            Map.entry("漫步者", List.of("漫步者", "edifier")),
+            Map.entry("倍思", List.of("倍思", "baseus")),
+            Map.entry("Anker", List.of("anker", "soundcore"))
+        );
+        private static final Map<String, List<String>> HEADPHONE_TYPE_KEYWORDS = Map.ofEntries(
+            Map.entry("入耳式", List.of("入耳", "入耳式", "tws")),
+            Map.entry("半入耳式", List.of("半入耳", "半开放")),
+            Map.entry("头戴式", List.of("头戴", "头戴式", "over-ear")),
+            Map.entry("挂耳式", List.of("挂耳", "耳挂")),
+            Map.entry("骨传导", List.of("骨传导", "open-ear", "开放式"))
+        );
+        private static final List<String> COLOR_KEYWORDS = List.of(
+            "黑色", "白色", "银色", "灰色", "蓝色", "红色", "紫色", "粉色", "绿色", "金色", "深空灰", "午夜色"
+        );
 
     private static final Map<String, List<String>> INTENT_KEYWORDS = Map.ofEntries(
             Map.entry("耳机", List.of("耳机", "headphone", "audio", "buds", "airpods", "freebuds", "降噪")),
@@ -97,6 +130,8 @@ public class AiShoppingAdvisorService {
     private final ShoppingAdvisorTools shoppingAdvisorTools;
     @SuppressWarnings("unused")
     private final AdvisorToolContext advisorToolContext;
+    private final ObjectMapper objectMapper;
+    private final WebClient.Builder webClientBuilder;
 
     private volatile ChatLanguageModel chatLanguageModel;
     private volatile ShoppingAdvisorAiService shoppingAdvisorAiService;
@@ -104,6 +139,9 @@ public class AiShoppingAdvisorService {
 
     private final ConcurrentMap<String, ChatMemory> shoppingAdvisorMemories = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, ChatMemory> directAdvisorMemories = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, Deque<String>> recentClarificationDimensionsBySession = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, SessionRequirementProfile> requirementProfileBySession = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, Deque<UUID>> recentRecommendedProductsBySession = new ConcurrentHashMap<>();
 
     private final ChatMemoryProvider shoppingAdvisorMemoryProvider = memoryId -> shoppingAdvisorMemories
             .computeIfAbsent(String.valueOf(memoryId), ignored -> MessageWindowChatMemory.withMaxMessages(20));
@@ -121,7 +159,9 @@ public class AiShoppingAdvisorService {
                                     OrderItemRepository orderItemRepository,
                                     ProductRepository productRepository,
                                     ShoppingAdvisorTools shoppingAdvisorTools,
-                                    AdvisorToolContext advisorToolContext) {
+                                    AdvisorToolContext advisorToolContext,
+                                    ObjectMapper objectMapper,
+                                    WebClient.Builder webClientBuilder) {
         this.aiProperties = aiProperties;
         this.retrievalGatewayService = retrievalGatewayService;
         this.productRecommendationService = productRecommendationService;
@@ -131,6 +171,8 @@ public class AiShoppingAdvisorService {
         this.productRepository = productRepository;
         this.shoppingAdvisorTools = shoppingAdvisorTools;
         this.advisorToolContext = advisorToolContext;
+        this.objectMapper = objectMapper;
+        this.webClientBuilder = webClientBuilder;
         runtimeStatusRef.set(AiRuntimeStatus.initial(currentProviderName(), activeModelName()));
     }
 
@@ -141,14 +183,27 @@ public class AiShoppingAdvisorService {
         return Mono.zip(
                         // ✅ 改为按 sessionId 过滤，确保新会话不会继承旧会话的数据
                         chatMessageRepository.findByUserIdAndSessionId(userId, effectiveSessionId).collectList(),
-                        retrievalGatewayService.search(message, 16, null, null)
-                                .map(RetrievalGatewayService.RetrievalChunk::product)
-                                .collectList(),
+                retrievalGatewayService.search(message, 10, null, null).collectList(),
                         productRepository.findAll().collectList(),
                         orderItemRepository.findAll().collectList())
-                .flatMap(tuple -> Mono.fromCallable(() -> buildAdvice(userId, message, effectiveSessionId, tuple.getT1(), tuple.getT2(), tuple.getT3(), tuple.getT4()))
+            .flatMap(tuple -> Mono.fromCallable(() -> buildAdvice(userId, message, effectiveSessionId, tuple.getT1(), tuple.getT2(), tuple.getT3(), tuple.getT4(), null))
                         .subscribeOn(Schedulers.boundedElastic()));
     }
+
+            public Mono<ChatAdvicePayload> adviseStream(UUID userId,
+                                String message,
+                                String sessionId,
+                                Consumer<String> tokenConsumer) {
+            String effectiveSessionId = (sessionId == null || sessionId.trim().isEmpty()) ? "default" : sessionId;
+
+            return Mono.zip(
+                    chatMessageRepository.findByUserIdAndSessionId(userId, effectiveSessionId).collectList(),
+                    retrievalGatewayService.search(message, 16, null, null).collectList(),
+                    productRepository.findAll().collectList(),
+                    orderItemRepository.findAll().collectList())
+                .flatMap(tuple -> Mono.fromCallable(() -> buildAdvice(userId, message, effectiveSessionId, tuple.getT1(), tuple.getT2(), tuple.getT3(), tuple.getT4(), tokenConsumer))
+                    .subscribeOn(Schedulers.boundedElastic()));
+            }
 
     public Mono<ChatAdvicePayload> adviseQuick(UUID userId, String message, String sessionId) {
         // 【快速模式】跳过知识库澄清，直接推荐
@@ -177,7 +232,9 @@ public class AiShoppingAdvisorService {
                     }
                     
                     Map<UUID, Integer> salesMap = aggregateSales(soldItems);
-                    List<Product> ranked = rankAndFilterProducts(message, budget, intent, retrievedProducts, allProducts, salesMap);
+                        List<Product> ranked = rankAndFilterProducts(message, budget, intent,
+                            "", "", "", "", "", "", effectiveSessionId,
+                            retrievedProducts, allProducts, salesMap);
                     
                     if (ranked.isEmpty()) {
                         String reply = "按你的条件没找到完全匹配产品，建议放宽条件试试。";
@@ -186,6 +243,7 @@ public class AiShoppingAdvisorService {
                     
                     // 快速推荐：仅前3件 + 简洁文案
                     List<ChatRecommendationResponse> recommendations = toRecommendations(ranked, salesMap, budget);
+                    recordRecommendedProducts(effectiveSessionId, recommendations);
                     String quickReply = formatQuickRecommendationReply(intent, budget, ranked);
                     
                     recordSuccess();
@@ -199,7 +257,7 @@ public class AiShoppingAdvisorService {
             return "暂无推荐";
         }
         
-        Product top = products.getFirst();
+        Product top = products.get(0);
         String budgetStr = budgetSummary(budget);
         return "根据你的需求（" + blankToDefault(intent, "通用") + "，" + budgetStr + "），"
                 + "我最推荐这款：" + safe(top.getName()) + " (" + formatPrice(top.getPrice()) + " 元)。"
@@ -230,9 +288,15 @@ public class AiShoppingAdvisorService {
                                           String message,
                                           String sessionId,
                                           List<ChatMessage> history,
-                                          List<Product> retrievedProducts,
+                          List<RetrievalGatewayService.RetrievalChunk> retrievalChunks,
                                           List<Product> allProducts,
-                                          List<OrderItem> soldItems) {
+                                          List<OrderItem> soldItems,
+                                          Consumer<String> tokenConsumer) {
+        List<Product> retrievedProducts = (retrievalChunks == null ? List.<RetrievalGatewayService.RetrievalChunk>of() : retrievalChunks)
+            .stream()
+            .map(RetrievalGatewayService.RetrievalChunk::product)
+            .filter(item -> item != null)
+            .toList();
         List<ChatMessage> effectiveHistory = extractEffectiveHistory(history, 12);
         
         // 检测是否是品类切换。如果是，过滤历史只保留最近的相关部分
@@ -240,6 +304,10 @@ public class AiShoppingAdvisorService {
         List<ChatMessage> contextualHistory = isCategorySwitch
             ? filterHistoryForNewCategory(message, effectiveHistory)
             : effectiveHistory;
+        if (isCategorySwitch) {
+            recentClarificationDimensionsBySession.remove(sessionId);
+            requirementProfileBySession.remove(sessionId);
+        }
         
         String currentIntent = detectIntent(message);
         List<String> recentUserMessages = extractRecentUserMessages(contextualHistory, 6);
@@ -248,20 +316,110 @@ public class AiShoppingAdvisorService {
         List<String> inferenceHistory = shouldUseHistoryForInference(message, baseHistory)
             ? baseHistory
             : List.of();
-        int clarificationTurns = countRecentClarificationTurns(contextualHistory);
         String mergedUserContext = mergeContext(message, inferenceHistory);
 
         BigDecimal budget = resolveBudget(message, inferenceHistory);
         String intent = resolveIntent(message, inferenceHistory);
-        if (isBlank(intent)) {
-            intent = inferIntentFromProducts(retrievedProducts);
-        }
+        intent = normalizeDetectedIntent(message, intent);
         String scene = resolveScene(message, inferenceHistory, intent, isCategorySwitch);
         String functionPreference = resolveFunctionPreference(message, inferenceHistory, intent, isCategorySwitch);
         String appearancePreference = resolveAppearancePreference(message, inferenceHistory, intent, isCategorySwitch);
+        String brandPreference = resolveBrandPreference(message, inferenceHistory, intent, isCategorySwitch);
+        String typePreference = resolveTypePreference(message, inferenceHistory, intent, isCategorySwitch);
+        String colorPreference = resolveColorPreference(message, inferenceHistory, intent, isCategorySwitch);
+
+        SessionRequirementProfile profile = requirementProfileBySession.get(sessionId);
+        if (profile != null && shouldApplySessionProfile(intent, profile)) {
+            if (isBlank(intent)) {
+                intent = profile.intent();
+            }
+            if (budget == null) {
+                budget = profile.budget();
+            }
+            if (isBlank(scene)) {
+                scene = profile.scene();
+            }
+            if (isBlank(functionPreference)) {
+                functionPreference = profile.functionPreference();
+            }
+            if (isBlank(appearancePreference)) {
+                appearancePreference = profile.appearancePreference();
+            }
+            if (isBlank(brandPreference)) {
+                brandPreference = profile.brandPreference();
+            }
+            if (isBlank(typePreference)) {
+                typePreference = profile.typePreference();
+            }
+            if (isBlank(colorPreference)) {
+                colorPreference = profile.colorPreference();
+            }
+        }
+
+        String lastAskedDimension = recentAskedDimensions(sessionId).stream().reduce((left, right) -> right).orElse("");
+        if (!isBlank(lastAskedDimension) && !isFollowUpMessage(message)) {
+            String normalizedAsked = normalizeDimensionKey(lastAskedDimension);
+            String raw = safe(message).trim();
+            switch (normalizedAsked) {
+                case "budget" -> {
+                    if (budget == null) {
+                        budget = extractBudget(raw);
+                    }
+                }
+                case "scene" -> {
+                    if (isBlank(scene) && !raw.isBlank()) {
+                        String inferred = detectScene(raw);
+                        scene = isBlank(inferred) ? raw : inferred;
+                    }
+                }
+                case "function" -> {
+                    if (isBlank(functionPreference) && !raw.isBlank()) {
+                        String inferred = detectFunctionPreference(raw);
+                        functionPreference = isBlank(inferred) ? raw : inferred;
+                    }
+                }
+                case "appearance" -> {
+                    if (isBlank(appearancePreference) && !raw.isBlank()) {
+                        String inferred = detectAppearancePreference(raw);
+                        appearancePreference = isBlank(inferred) ? raw : inferred;
+                    }
+                }
+                case "brand" -> {
+                    if (isBlank(brandPreference) && !raw.isBlank()) {
+                        String inferred = detectBrandPreference(raw);
+                        if (isBlank(inferred) && containsAny(raw.toLowerCase(Locale.ROOT), List.of("都可以", "不限", "随便"))) {
+                            inferred = "品牌不限";
+                        }
+                        brandPreference = inferred;
+                    }
+                }
+                case "type" -> {
+                    if (isBlank(typePreference) && !raw.isBlank()) {
+                        String inferred = detectTypePreference(raw);
+                        if (isBlank(inferred) && containsAny(raw.toLowerCase(Locale.ROOT), List.of("都可以", "不限", "随便"))) {
+                            inferred = "类型不限";
+                        }
+                        typePreference = inferred;
+                    }
+                }
+                case "color" -> {
+                    if (isBlank(colorPreference) && !raw.isBlank()) {
+                        String inferred = detectColorPreference(raw);
+                        if (isBlank(inferred) && containsAny(raw.toLowerCase(Locale.ROOT), List.of("都可以", "不限", "随便"))) {
+                            inferred = "颜色不限";
+                        }
+                        colorPreference = inferred;
+                    }
+                }
+                default -> {
+                    // no-op
+                }
+            }
+        }
 
         boolean acceptsGenericPreference = acceptsGenericPreference(message, inferenceHistory);
-        if (acceptsGenericPreference) {
+        // 耳机导购保持高精度：不因“都可以”自动补默认，避免 2 问就推荐。
+        if (acceptsGenericPreference && !HEADPHONE_INTENT.equals(intent)) {
             if (isBlank(scene)) {
                 scene = defaultSceneByIntent(intent);
             }
@@ -271,6 +429,9 @@ public class AiShoppingAdvisorService {
             if (isBlank(appearancePreference)) {
                 appearancePreference = "简约通用";
             }
+            if (isBlank(brandPreference)) {
+                brandPreference = "主流品牌均可";
+            }
         }
 
         List<AdvisorKnowledgeBaseService.KnowledgeSnippet> snippets = advisorKnowledgeBaseService
@@ -278,29 +439,13 @@ public class AiShoppingAdvisorService {
         AdvisorKnowledgeBaseService.ClarificationPlan plan = advisorKnowledgeBaseService
                 .resolveClarificationPlan(intent, snippets);
 
-        List<String> missingDimensions = resolveMissingDimensions(plan, budget, scene, functionPreference, appearancePreference, intent);
-        int fulfilledDimensions = countFulfilledDimensions(budget, scene, functionPreference, appearancePreference, intent);
-        boolean aiReady = hasAvailableModelProvider();
-        
-        // 根据知识库计划动态调整澄清轮数
-        int adaptiveMaxClarificationTurns = calculateAdaptiveMaxTurns(plan, missingDimensions, snippets);
-        
-        if (!missingDimensions.isEmpty()) {
-            String dimensionToAsk = selectBestDimensionToAsk(missingDimensions, plan, contextualHistory, intent);
+        List<String> requiredDimensions = resolveRequiredDimensions(plan);
 
-            if (!dimensionToAsk.isBlank() && clarificationTurns < adaptiveMaxClarificationTurns) {
-                return buildClarificationPayload(intent, budget, dimensionToAsk, plan, snippets);
-            }
+        List<String> missingDimensions = resolveMissingDimensions(plan, budget, scene, functionPreference, appearancePreference,
+            brandPreference, typePreference, colorPreference, intent);
+        boolean directRecommendation = wantsDirectRecommendation(message, inferenceHistory);
 
-            // 已连续澄清多轮时，自动补齐默认值并进入推荐，避免循环追问。
-            if (fulfilledDimensions < MIN_REQUIRED_DIMENSIONS_TO_RECOMMEND
-                    && clarificationTurns < adaptiveMaxClarificationTurns) {
-                return buildClarificationPayload(intent, budget, "preference", plan, snippets);
-            }
-
-            if (isBlank(intent)) {
-                intent = inferIntentFromProducts(retrievedProducts);
-            }
+        if (directRecommendation) {
             if (isBlank(scene)) {
                 scene = defaultSceneByIntent(intent);
             }
@@ -308,28 +453,53 @@ public class AiShoppingAdvisorService {
                 functionPreference = defaultFunctionByIntent(intent);
             }
             if (isBlank(appearancePreference)) {
-                appearancePreference = acceptsGenericPreference ? "简约通用" : "主流通用";
+                appearancePreference = "主流通用风格";
             }
+            if (isBlank(brandPreference)) {
+                brandPreference = "主流品牌均可";
+            }
+            if (HEADPHONE_INTENT.equals(intent)) {
+                if (isBlank(typePreference)) {
+                    typePreference = "类型不限";
+                }
+                if (isBlank(colorPreference)) {
+                    colorPreference = "颜色不限";
+                }
+            }
+            missingDimensions = resolveMissingDimensions(plan, budget, scene, functionPreference, appearancePreference,
+                    brandPreference, typePreference, colorPreference, intent);
         }
 
-        if (countFulfilledDimensions(budget, scene, functionPreference, appearancePreference, intent) < MIN_REQUIRED_DIMENSIONS_TO_RECOMMEND
-                && clarificationTurns < adaptiveMaxClarificationTurns) {
-            return buildClarificationPayload(intent, budget, "preference", plan, snippets);
-        }
+            requirementProfileBySession.put(sessionId, new SessionRequirementProfile(
+                blankToDefault(intent, "耳机"),
+                budget,
+                safe(scene),
+                safe(functionPreference),
+                safe(appearancePreference),
+                safe(brandPreference),
+                safe(typePreference),
+                safe(colorPreference),
+                Instant.now()));
 
-        // 模型不可用时，提升澄清门槛，避免过早进入模板推荐导致“兜底感”过强。
-        if (!aiReady
-                && countFulfilledDimensions(budget, scene, functionPreference, appearancePreference, intent) < MIN_REQUIRED_DIMENSIONS_WITHOUT_AI
-                && clarificationTurns < adaptiveMaxClarificationTurns + 1) {
-            String dimensionToAsk = selectBestDimensionToAsk(missingDimensions, plan, contextualHistory, intent);
+        if (!missingDimensions.isEmpty()) {
+            List<String> recentAskedDimensions = recentAskedDimensions(sessionId);
+            String dimensionToAsk = selectBestDimensionToAsk(missingDimensions, plan, contextualHistory, intent, recentAskedDimensions);
             if (dimensionToAsk.isBlank()) {
                 dimensionToAsk = "preference";
             }
-            return buildClarificationPayload(intent, budget, dimensionToAsk, plan, snippets);
+            recordAskedDimension(sessionId, dimensionToAsk);
+            List<String> collectedDimensions = resolveCollectedDimensions(requiredDimensions, missingDimensions);
+            int completionPercent = calculateCompletionPercent(requiredDimensions, collectedDimensions);
+            return buildClarificationPayload(intent, budget, dimensionToAsk, plan, snippets,
+                    collectedDimensions, missingDimensions, completionPercent, retrievalChunks);
         }
 
+        recentClarificationDimensionsBySession.remove(sessionId);
+
         Map<UUID, Integer> salesMap = aggregateSales(soldItems);
-        List<Product> ranked = rankAndFilterProducts(mergedUserContext, budget, intent, retrievedProducts, allProducts, salesMap);
+        List<Product> ranked = rankAndFilterProducts(mergedUserContext, budget, intent,
+            scene, functionPreference, appearancePreference, brandPreference, typePreference, colorPreference, sessionId,
+            retrievedProducts, allProducts, salesMap);
 
         if (ranked.isEmpty()) {
             String reply = "我已经按你给的条件在商品库里筛了一轮，暂时没有完全匹配的款。"
@@ -339,35 +509,81 @@ public class AiShoppingAdvisorService {
                     reply,
                     List.of(),
                     List.of(),
-                    buildInsights(intent, budget, snippets, true, "商品库无匹配结果"),
+                    buildInsights(intent, budget, snippets, true, "商品库无匹配结果", retrievalChunks),
                     detectedIntentLabel(intent, scene),
                     budgetSummary(budget),
                     true);
         }
 
         List<ChatRecommendationResponse> recommendations = toRecommendations(ranked, salesMap, budget);
+        recordRecommendedProducts(sessionId, recommendations);
         List<Product> mainProducts = ranked.stream().limit(MAX_MAIN_RECOMMENDATIONS).toList();
 
-        String aiReply = generateRecommendationReply(userId, message, contextualHistory, budget, scene, intent,
-                functionPreference, appearancePreference, mainProducts, snippets, sessionId);
+        String aiReply = tokenConsumer == null
+            ? generateRecommendationReply(userId, message, contextualHistory, budget, scene, intent,
+                functionPreference, appearancePreference, brandPreference, typePreference, colorPreference, mainProducts, snippets, sessionId)
+            : generateRecommendationReplyStreaming(userId, message, contextualHistory, budget, scene, intent,
+                functionPreference, appearancePreference, brandPreference, typePreference, colorPreference, mainProducts, snippets, sessionId, tokenConsumer);
+
+        String finalReply = ensureSummaryPreface(aiReply, intent, budget, scene,
+            functionPreference, appearancePreference, brandPreference, typePreference, colorPreference);
 
         recordSuccess();
         return new ChatAdvicePayload(
-                aiReply,
+            finalReply,
                 recommendations,
-            List.of(),
-                buildInsights(intent, budget, snippets, false, activeModelLabel()),
+                List.of(),
+                appendCompletenessInsights(
+                buildInsights(intent, budget, snippets, false, activeModelLabel(), retrievalChunks),
+                        requiredDimensions,
+                        List.of()),
                 detectedIntentLabel(intent, scene),
                 budgetSummary(budget),
                 false);
+    }
+
+    private boolean wantsDirectRecommendation(String message, List<String> history) {
+        String merged = safe(message) + "\n" + String.join("\n", history == null ? List.of() : history);
+        String normalized = merged.toLowerCase(Locale.ROOT);
+        return DIRECT_RECOMMEND_WORDS.stream().anyMatch(word -> normalized.contains(word.toLowerCase(Locale.ROOT)));
+    }
+
+    private String normalizeDetectedIntent(String message, String detectedIntent) {
+        String normalizedMessage = safe(message).toLowerCase(Locale.ROOT);
+        boolean containsAudioSignals = INTENT_KEYWORDS.getOrDefault(HEADPHONE_INTENT, List.of("耳机"))
+                .stream()
+                .map(item -> item.toLowerCase(Locale.ROOT))
+                .anyMatch(normalizedMessage::contains);
+
+        if (!isBlank(detectedIntent)) {
+            return detectedIntent;
+        }
+        if (containsAudioSignals) {
+            return HEADPHONE_INTENT;
+        }
+        return "";
+    }
+
+    private boolean shouldApplySessionProfile(String currentIntent, SessionRequirementProfile profile) {
+        if (profile == null) {
+            return false;
+        }
+        if (isBlank(currentIntent)) {
+            return true;
+        }
+        return currentIntent.equals(safe(profile.intent()));
     }
 
     private ChatAdvicePayload buildClarificationPayload(String intent,
                                                         BigDecimal budget,
                                                         String missingDimension,
                                                         AdvisorKnowledgeBaseService.ClarificationPlan plan,
-                                                        List<AdvisorKnowledgeBaseService.KnowledgeSnippet> snippets) {
-        String question = safe(plan.questionByDimension(missingDimension));
+                                                        List<AdvisorKnowledgeBaseService.KnowledgeSnippet> snippets,
+                                                        List<String> collectedDimensions,
+                                                        List<String> missingDimensions,
+                                                        int completionPercent,
+                                                        List<RetrievalGatewayService.RetrievalChunk> retrievalChunks) {
+        String question = buildProfessionalClarificationQuestion(intent, missingDimension, plan, snippets);
         if (question.isBlank()) {
             question = "我先补一个关键信息，这样推荐不会跑偏：你最在意预算、场景还是功能？";
         }
@@ -376,6 +592,9 @@ public class AiShoppingAdvisorService {
         insights.add(new ChatInsightResponse("导购阶段", "需求补全中"));
         insights.add(new ChatInsightResponse("待确认维度", missingDimension));
         insights.add(new ChatInsightResponse("知识库命中", String.valueOf(snippets.size())));
+        insights.add(new ChatInsightResponse("需求完整度", completionPercent + "%"));
+        insights.add(new ChatInsightResponse("已收集维度", joinDimensionLabels(collectedDimensions)));
+        insights.add(new ChatInsightResponse("缺失维度", joinDimensionLabels(missingDimensions)));
         if (!snippets.isEmpty()) {
             String topic = snippets.stream()
                     .limit(2)
@@ -383,6 +602,7 @@ public class AiShoppingAdvisorService {
                     .collect(Collectors.joining(" | "));
             insights.add(new ChatInsightResponse("参考知识", topic));
         }
+        insights.addAll(vectorizationInsights(retrievalChunks));
 
         return new ChatAdvicePayload(
                 question,
@@ -394,6 +614,82 @@ public class AiShoppingAdvisorService {
                 false);
     }
 
+    private List<ChatInsightResponse> appendCompletenessInsights(List<ChatInsightResponse> insights,
+                                                                 List<String> requiredDimensions,
+                                                                 List<String> missingDimensions) {
+        List<ChatInsightResponse> enriched = new ArrayList<>(insights);
+        List<String> collectedDimensions = resolveCollectedDimensions(requiredDimensions, missingDimensions);
+        int completionPercent = calculateCompletionPercent(requiredDimensions, collectedDimensions);
+        enriched.add(new ChatInsightResponse("需求完整度", completionPercent + "%"));
+        enriched.add(new ChatInsightResponse("已收集维度", joinDimensionLabels(collectedDimensions)));
+        enriched.add(new ChatInsightResponse("缺失维度", joinDimensionLabels(missingDimensions)));
+        return enriched;
+    }
+
+    private List<String> resolveRequiredDimensions(AdvisorKnowledgeBaseService.ClarificationPlan plan) {
+        List<String> required = normalizeDimensions(plan == null ? List.of() : plan.requiredDimensions());
+        if (!required.isEmpty()) {
+            return required;
+        }
+        return List.of("budget", "scene", "function", "appearance");
+    }
+
+    private List<String> normalizeDimensions(List<String> dimensions) {
+        return (dimensions == null ? List.<String>of() : dimensions).stream()
+                .map(this::normalizeDimensionKey)
+                .filter(item -> !item.isBlank())
+                .distinct()
+                .toList();
+    }
+
+    private String normalizeDimensionKey(String key) {
+        String normalized = safe(key).trim().toLowerCase(Locale.ROOT);
+        return switch (normalized) {
+            case "usage" -> "scene";
+            case "feature" -> "function";
+            case "style" -> "appearance";
+            default -> normalized;
+        };
+    }
+
+    private List<String> resolveCollectedDimensions(List<String> requiredDimensions, List<String> missingDimensions) {
+        Set<String> missing = normalizeDimensions(missingDimensions).stream().collect(Collectors.toSet());
+        return normalizeDimensions(requiredDimensions).stream()
+                .filter(item -> !missing.contains(item))
+                .toList();
+    }
+
+    private int calculateCompletionPercent(List<String> requiredDimensions, List<String> collectedDimensions) {
+        int total = Math.max(1, normalizeDimensions(requiredDimensions).size());
+        int collected = normalizeDimensions(collectedDimensions).size();
+        return (int) Math.round((collected * 100.0d) / total);
+    }
+
+    private String joinDimensionLabels(List<String> dimensions) {
+        List<String> labels = normalizeDimensions(dimensions).stream()
+                .map(this::dimensionLabel)
+                .toList();
+        if (labels.isEmpty()) {
+            return "无";
+        }
+        return String.join("、", labels);
+    }
+
+    private String dimensionLabel(String key) {
+        return switch (normalizeDimensionKey(key)) {
+            case "budget" -> "预算";
+            case "scene" -> "使用场景";
+            case "function" -> "核心功能";
+            case "appearance" -> "佩戴/外观";
+            case "brand" -> "品牌偏好";
+            case "type" -> "类型偏好";
+            case "color" -> "颜色偏好";
+            case "preference" -> "补充偏好";
+            case "intent" -> "品类意图";
+            default -> "其他";
+        };
+    }
+
     private String generateRecommendationReply(UUID userId,
                                                String message,
                                                List<ChatMessage> history,
@@ -402,46 +698,14 @@ public class AiShoppingAdvisorService {
                                                String intent,
                                                String functionPreference,
                                                String appearancePreference,
+                                                   String brandPreference,
+                                                   String typePreference,
+                                                   String colorPreference,
                                                List<Product> products,
                                                List<AdvisorKnowledgeBaseService.KnowledgeSnippet> snippets,
                                                String sessionId) {
-        String productContext = products.stream()
-                .limit(MAX_MAIN_RECOMMENDATIONS)
-                .map(product -> "- 商品：" + safe(product.getName())
-                        + "；价格：" + formatPrice(product.getPrice()) + " 元"
-                        + "；标签：" + safe(product.getTags())
-                        + "；描述：" + safe(product.getDescription()))
-                .collect(Collectors.joining("\n"));
-
-        String historyContext = history.stream()
-                .sorted(Comparator.comparing(ChatMessage::getCreatedAt, Comparator.nullsLast(Comparator.naturalOrder())))
-                .skip(Math.max(0, history.size() - 6L))
-                .map(item -> ("USER".equalsIgnoreCase(item.getRole()) ? "用户" : "助手") + "：" + safe(item.getContent()))
-                .collect(Collectors.joining("\n"));
-
-        String knowledgeContext = snippets.isEmpty()
-                ? "暂无命中，使用通用导购策略。"
-                : snippets.stream()
-                .limit(3)
-                .map(snippet -> "- [" + safe(snippet.category()) + "] " + safe(snippet.title()) + "：" + safe(snippet.summary()))
-                .collect(Collectors.joining("\n"));
-
-        String prompt = "你是中文电商导购员“小选”。必须严格按以下规则回复：\n"
-                + "1. 只使用给定商品，不编造型号和价格。\n"
-            + "2. 输出结构：需求速览、主推1款、备选1-2款、购买建议。\n"
-            + "3. 每个推荐都要解释为何匹配用户场景，避免空泛话术。\n"
-            + "4. 语气像真人导购，简洁自然，不要 Markdown 表格。\n"
-            + "5. 不要重复追问已经给出的信息。\n\n"
-                + "用户本轮消息：" + safe(message) + "\n"
-                + "识别品类：" + blankToDefault(intent, "未识别") + "\n"
-                + "预算：" + budgetSummary(budget) + "\n"
-                + "场景：" + blankToDefault(scene, "未明确") + "\n"
-                + "功能偏好：" + blankToDefault(functionPreference, "未明确") + "\n"
-                + "外观偏好：" + blankToDefault(appearancePreference, "未明确") + "\n\n"
-                + "知识库片段：\n" + knowledgeContext + "\n\n"
-                + "最近对话：\n" + (historyContext.isBlank() ? "暂无" : historyContext) + "\n\n"
-                + "候选商品：\n" + productContext;
-
+                            String prompt = buildRecommendationPrompt(message, history, budget, scene, intent, functionPreference, appearancePreference,
+                                brandPreference, typePreference, colorPreference, products, snippets);
         String conversationId = resolveRequestScopedConversationId(userId, sessionId);
 
         try {
@@ -474,6 +738,185 @@ public class AiShoppingAdvisorService {
         return buildRuleBasedReply(intent, budget, scene, products);
     }
 
+    private String generateRecommendationReplyStreaming(UUID userId,
+                                                        String message,
+                                                        List<ChatMessage> history,
+                                                        BigDecimal budget,
+                                                        String scene,
+                                                        String intent,
+                                                        String functionPreference,
+                                                        String appearancePreference,
+                                                        String brandPreference,
+                                                        String typePreference,
+                                                        String colorPreference,
+                                                        List<Product> products,
+                                                        List<AdvisorKnowledgeBaseService.KnowledgeSnippet> snippets,
+                                                        String sessionId,
+                                                        Consumer<String> tokenConsumer) {
+                                String prompt = buildRecommendationPrompt(message, history, budget, scene, intent, functionPreference, appearancePreference,
+                                    brandPreference, typePreference, colorPreference, products, snippets);
+
+        String streamed = streamReplyFromProvider(prompt, tokenConsumer);
+        String normalized = normalizeReply(streamed);
+        if (normalized != null) {
+            recordSuccess();
+            return normalized;
+        }
+
+        // 流式失败时回退到同步路径，并用字符级回调保持前端流式体验不中断。
+        String fallback = generateRecommendationReply(userId, message, history, budget, scene, intent,
+            functionPreference, appearancePreference, brandPreference, typePreference, colorPreference, products, snippets, sessionId);
+        if (fallback != null && tokenConsumer != null) {
+            fallback.codePoints().forEach(codePoint -> tokenConsumer.accept(new String(Character.toChars(codePoint))));
+        }
+        return fallback;
+    }
+
+    private String buildRecommendationPrompt(String message,
+                                             List<ChatMessage> history,
+                                             BigDecimal budget,
+                                             String scene,
+                                             String intent,
+                                             String functionPreference,
+                                             String appearancePreference,
+                                             String brandPreference,
+                                             String typePreference,
+                                             String colorPreference,
+                                             List<Product> products,
+                                             List<AdvisorKnowledgeBaseService.KnowledgeSnippet> snippets) {
+        String productContext = products.stream()
+                .limit(MAX_MAIN_RECOMMENDATIONS)
+                .map(product -> "- 商品：" + safe(product.getName())
+                        + "；价格：" + formatPrice(product.getPrice()) + " 元"
+                        + "；标签：" + safe(product.getTags())
+                        + "；描述：" + safe(product.getDescription()))
+                .collect(Collectors.joining("\n"));
+
+        String historyContext = history.stream()
+                .sorted(Comparator.comparing(ChatMessage::getCreatedAt, Comparator.nullsLast(Comparator.naturalOrder())))
+                .skip(Math.max(0, history.size() - 6L))
+                .map(item -> ("USER".equalsIgnoreCase(item.getRole()) ? "用户" : "助手") + "：" + safe(item.getContent()))
+                .collect(Collectors.joining("\n"));
+
+        String knowledgeContext = snippets.isEmpty()
+                ? "暂无命中，使用通用导购策略。"
+                : snippets.stream()
+                .limit(3)
+                .map(snippet -> "- [" + safe(snippet.category()) + "] " + safe(snippet.title()) + "：" + safe(snippet.summary()))
+                .collect(Collectors.joining("\n"));
+
+        String prompt = "你是中文电商资深导购顾问“小选”。必须严格按以下规则回复：\n"
+            + "1. 只使用给定商品，不编造型号、参数、价格。\n"
+            + "2. 输出结构固定为：\n"
+            + "   【需求速览】1-2 行\n"
+            + "   【主推】1 款（明确推荐理由）\n"
+            + "   【备选】1-2 款（说明与主推的取舍差异）\n"
+            + "   【购买建议】1 行（下单/加购建议）\n"
+            + "3. 每个推荐理由要绑定“场景 + 预算 + 功能偏好”，避免空话。\n"
+            + "4. 语气专业但自然，短句优先，不使用 Markdown 表格。\n"
+            + "5. 已提供的信息不重复追问；若信息不足，只补问 1 个最高优先级维度。\n\n"
+                + "用户本轮消息：" + safe(message) + "\n"
+                + "识别品类：" + blankToDefault(intent, "未识别") + "\n"
+                + "预算：" + budgetSummary(budget) + "\n"
+                + "场景：" + blankToDefault(scene, "未明确") + "\n"
+                + "功能偏好：" + blankToDefault(functionPreference, "未明确") + "\n"
+                + "外观偏好：" + blankToDefault(appearancePreference, "未明确") + "\n"
+                + "品牌偏好：" + blankToDefault(brandPreference, "未明确") + "\n"
+                + "类型偏好：" + blankToDefault(typePreference, "未明确") + "\n"
+                + "颜色偏好：" + blankToDefault(colorPreference, "未明确") + "\n\n"
+                + "知识库片段：\n" + knowledgeContext + "\n\n"
+                + "最近对话：\n" + (historyContext.isBlank() ? "暂无" : historyContext) + "\n\n"
+                + "候选商品：\n" + productContext;
+            return prompt;
+    }
+
+    private String streamReplyFromProvider(String prompt, Consumer<String> tokenConsumer) {
+        AiProperties.Provider provider = currentProvider();
+        if (provider == null || isBlank(provider.getApiKey()) || isBlank(provider.getModelName())) {
+            recordFallback("MODEL_CONFIG_MISSING");
+            return null;
+        }
+
+        String baseUrl = normalizeBaseUrl(isBlank(provider.getBaseUrl()) ? "https://api.deepseek.com/v1" : provider.getBaseUrl());
+        Duration timeout = provider.getTimeout() == null ? Duration.ofSeconds(90) : provider.getTimeout();
+
+        Map<String, Object> requestBody = new LinkedHashMap<>();
+        requestBody.put("model", provider.getModelName());
+        requestBody.put("stream", true);
+        requestBody.put("messages", List.of(Map.of("role", "user", "content", prompt)));
+
+        StringBuilder output = new StringBuilder();
+
+        try {
+            webClientBuilder
+                    .baseUrl(baseUrl)
+                    .defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + provider.getApiKey())
+                    .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
+                    .build()
+                    .post()
+                    .uri("/chat/completions")
+                    .accept(MediaType.TEXT_EVENT_STREAM)
+                    .bodyValue(requestBody)
+                    .retrieve()
+                    .bodyToFlux(String.class)
+                    .timeout(timeout)
+                    .doOnNext(chunk -> consumeSseChunk(chunk, output, tokenConsumer))
+                    .blockLast(timeout.plusSeconds(2));
+
+            return output.toString();
+        } catch (Exception error) {
+            recordFallback("MODEL_STREAM_FAILED: " + summarizeError(error));
+            return null;
+        }
+    }
+
+    private void consumeSseChunk(String chunk, StringBuilder output, Consumer<String> tokenConsumer) {
+        if (isBlank(chunk)) {
+            return;
+        }
+        String[] lines = chunk.split("\\r?\\n");
+        for (String line : lines) {
+            if (line == null || !line.startsWith("data:")) {
+                continue;
+            }
+            String payload = line.substring(5).trim();
+            if (payload.isBlank() || "[DONE]".equals(payload)) {
+                continue;
+            }
+            String token = extractDeltaContent(payload);
+            if (token == null || token.isEmpty()) {
+                continue;
+            }
+            output.append(token);
+            if (tokenConsumer != null) {
+                tokenConsumer.accept(token);
+            }
+        }
+    }
+
+    private String extractDeltaContent(String payload) {
+        try {
+            JsonNode root = objectMapper.readTree(payload);
+            JsonNode choices = root.path("choices");
+            if (!choices.isArray() || choices.isEmpty()) {
+                return "";
+            }
+            JsonNode delta = choices.get(0).path("delta");
+            JsonNode content = delta.path("content");
+            return content.isMissingNode() || content.isNull() ? "" : content.asText("");
+        } catch (Exception error) {
+            log.debug("Failed to parse stream payload: {}", summarizeError(error));
+            return "";
+        }
+    }
+
+    private String normalizeBaseUrl(String url) {
+        if (url == null) {
+            return "";
+        }
+        return url.endsWith("/") ? url.substring(0, url.length() - 1) : url;
+    }
+
     private String resolveRequestScopedConversationId(UUID userId, String sessionId) {
         String base = userId == null ? "anonymous" : userId.toString();
         String session = sessionId == null || sessionId.trim().isEmpty() ? "default" : sessionId;
@@ -485,6 +928,13 @@ public class AiShoppingAdvisorService {
     private List<Product> rankAndFilterProducts(String mergedUserContext,
                                                 BigDecimal budget,
                                                 String intent,
+                                                String scene,
+                                                String functionPreference,
+                                                String appearancePreference,
+                                                String brandPreference,
+                                                String typePreference,
+                                                String colorPreference,
+                                                String sessionId,
                                                 List<Product> retrievedProducts,
                                                 List<Product> allProducts,
                                                 Map<UUID, Integer> salesMap) {
@@ -509,18 +959,42 @@ public class AiShoppingAdvisorService {
             }
         }
 
+        Set<UUID> recentRecommendedIds = recentRecommendedProductIds(sessionId);
+        List<Product> nonRepeated = merged.stream()
+                .filter(product -> product.getId() == null || !recentRecommendedIds.contains(product.getId()))
+                .toList();
+        if (nonRepeated.size() >= MAX_MAIN_RECOMMENDATIONS) {
+            merged = nonRepeated;
+        }
+
         return merged.stream()
                 .sorted((left, right) -> Double.compare(
-                        productScore(mergedUserContext, right, salesMap.getOrDefault(right.getId(), 0), budget),
-                        productScore(mergedUserContext, left, salesMap.getOrDefault(left.getId(), 0), budget)))
+                        productScore(mergedUserContext, right, salesMap.getOrDefault(right.getId(), 0), budget,
+                                scene, functionPreference, appearancePreference, brandPreference, typePreference, colorPreference,
+                                recentRecommendedIds),
+                        productScore(mergedUserContext, left, salesMap.getOrDefault(left.getId(), 0), budget,
+                                scene, functionPreference, appearancePreference, brandPreference, typePreference, colorPreference,
+                                recentRecommendedIds)))
                 .limit(12)
                 .toList();
     }
 
-    private double productScore(String query, Product product, int salesCount, BigDecimal budget) {
+    private double productScore(String query,
+                                Product product,
+                                int salesCount,
+                                BigDecimal budget,
+                                String scene,
+                                String functionPreference,
+                                String appearancePreference,
+                                String brandPreference,
+                                String typePreference,
+                                String colorPreference,
+                                Set<UUID> recentRecommendedIds) {
         double relevance = retrievalGatewayService.relevanceScore(query, product);
         double salesBoost = Math.min(1.0d, salesCount / 10.0d) * 0.25d;
         double budgetBoost = 0.0d;
+        double preferenceBoost = preferenceScore(product, scene, functionPreference, appearancePreference, brandPreference, typePreference, colorPreference);
+        double diversityPenalty = (product.getId() != null && recentRecommendedIds.contains(product.getId())) ? -0.60d : 0.0d;
         if (budget != null && product.getPrice() != null) {
             if (product.getPrice().compareTo(budget) <= 0) {
                 budgetBoost = 0.2d;
@@ -528,7 +1002,46 @@ public class AiShoppingAdvisorService {
                 budgetBoost = -0.15d;
             }
         }
-        return relevance + salesBoost + budgetBoost;
+        return relevance + salesBoost + budgetBoost + preferenceBoost + diversityPenalty;
+    }
+
+    private double preferenceScore(Product product,
+                                   String scene,
+                                   String functionPreference,
+                                   String appearancePreference,
+                                   String brandPreference,
+                                   String typePreference,
+                                   String colorPreference) {
+        String searchable = (safe(product.getName()) + " " + safe(product.getDescription()) + " " + safe(product.getTags()) + " " + safe(product.getCategory()))
+                .toLowerCase(Locale.ROOT);
+
+        double score = 0.0d;
+        score += keywordMatchScore(searchable, scene, 0.20d);
+        score += keywordMatchScore(searchable, functionPreference, 0.24d);
+        score += keywordMatchScore(searchable, appearancePreference, 0.18d);
+        score += keywordMatchScore(searchable, brandPreference, 0.22d);
+        score += keywordMatchScore(searchable, typePreference, 0.20d);
+        score += keywordMatchScore(searchable, colorPreference, 0.16d);
+        return Math.min(0.90d, score);
+    }
+
+    private double keywordMatchScore(String searchable, String preference, double weight) {
+        if (isBlank(preference) || isBlank(searchable)) {
+            return 0.0d;
+        }
+        List<String> tokens = Pattern.compile("[\\s,，、/|>]+")
+                .splitAsStream(preference.toLowerCase(Locale.ROOT))
+                .map(String::trim)
+                .filter(item -> item.length() >= 2)
+                .toList();
+        if (tokens.isEmpty()) {
+            return 0.0d;
+        }
+        long hits = tokens.stream().filter(searchable::contains).count();
+        if (hits == 0) {
+            return 0.0d;
+        }
+        return (hits * 1.0d / tokens.size()) * weight;
     }
 
     private List<ChatRecommendationResponse> toRecommendations(List<Product> products,
@@ -573,13 +1086,16 @@ public class AiShoppingAdvisorService {
                                                     BigDecimal budget,
                                                     List<AdvisorKnowledgeBaseService.KnowledgeSnippet> snippets,
                                                     boolean fallback,
-                                                    String detail) {
+                                                    String detail,
+                                                    List<RetrievalGatewayService.RetrievalChunk> retrievalChunks) {
         List<ChatInsightResponse> insights = new ArrayList<>();
         insights.add(new ChatInsightResponse("AI模式", fallback ? "规则兜底" : "实时模型"));
         insights.add(new ChatInsightResponse(fallback ? "兜底原因" : "模型信息", detail));
+        insights.add(new ChatInsightResponse("知识库来源", advisorKnowledgeBaseService.knowledgeSourceLabel()));
         insights.add(new ChatInsightResponse("需求类型", blankToDefault(intent, "未识别")));
         insights.add(new ChatInsightResponse("预算范围", budgetSummary(budget)));
         insights.add(new ChatInsightResponse("知识库命中", String.valueOf(snippets.size())));
+        insights.add(new ChatInsightResponse("知识库向量检索", "已启用（哈希向量 + 关键词混合召回）"));
         if (!snippets.isEmpty()) {
             String topic = snippets.stream()
                     .limit(3)
@@ -587,7 +1103,96 @@ public class AiShoppingAdvisorService {
                     .collect(Collectors.joining(" | "));
             insights.add(new ChatInsightResponse("知识库主题", topic));
         }
+        insights.addAll(vectorizationInsights(retrievalChunks));
         return insights;
+    }
+
+    private List<ChatInsightResponse> vectorizationInsights(List<RetrievalGatewayService.RetrievalChunk> retrievalChunks) {
+        List<RetrievalGatewayService.RetrievalChunk> chunks = retrievalChunks == null ? List.of() : retrievalChunks;
+        List<ChatInsightResponse> insights = new ArrayList<>();
+        insights.add(new ChatInsightResponse("商品向量检索", "已启用（向量重排 + 语义打分）"));
+        insights.add(new ChatInsightResponse("向量候选数", String.valueOf(chunks.size())));
+        if (!chunks.isEmpty()) {
+            double best = chunks.stream()
+                    .mapToDouble(RetrievalGatewayService.RetrievalChunk::score)
+                    .max()
+                    .orElse(0.0d);
+            insights.add(new ChatInsightResponse("最高语义分", String.format(Locale.ROOT, "%.3f", best)));
+        }
+        return insights;
+    }
+
+    private String buildProfessionalClarificationQuestion(String intent,
+                                                          String missingDimension,
+                                                          AdvisorKnowledgeBaseService.ClarificationPlan plan,
+                                                          List<AdvisorKnowledgeBaseService.KnowledgeSnippet> snippets) {
+        String base = safe(plan == null ? "" : plan.questionByDimension(missingDimension));
+        String normalizedIntent = safe(intent).trim();
+        String dimension = normalizeDimensionKey(missingDimension);
+
+        String hint = categoryHintByDimension(normalizedIntent, dimension);
+
+        String knowledgeHit = snippets == null || snippets.isEmpty()
+                ? ""
+                : snippets.stream()
+                    .filter(item -> normalizedIntent.equals(safe(item.category())))
+                        .findFirst()
+                        .map(item -> "\n参考：" + safe(item.title()))
+                        .orElse("");
+
+        if (base.isBlank()) {
+            return hint + knowledgeHit;
+        }
+        return base + "\n" + hint + knowledgeHit;
+    }
+
+    private String categoryHintByDimension(String intent, String dimension) {
+        if (HEADPHONE_INTENT.equals(intent)) {
+            return switch (dimension) {
+                case "budget" -> "我会按 200以下 / 200-500 / 500-1000 / 1000以上 四档给你筛。";
+                case "scene" -> "不同场景权重不同：通勤看降噪续航，办公看通话清晰，运动看稳固防汗，游戏看低延迟。";
+                case "brand" -> "如果你有品牌或手机生态偏好（如苹果/华为/索尼），我可以直接按兼容性优先排序。";
+                case "type" -> "佩戴类型会直接影响舒适度：入耳便携隔音，半入耳舒适，头戴长戴更稳。";
+                case "function" -> "你可直接说优先级，比如“降噪>通话>音质”或“音质>舒适度”。";
+                case "color" -> "颜色我会尽量按你偏好筛，常见黑白/深色通常库存更稳定。";
+                case "appearance" -> "佩戴建议：通勤多选入耳，久戴办公可选头戴，运动优先防脱落设计。";
+                default -> "补齐这一项后我就可以直接给你 2-3 个可买方案。";
+            };
+        }
+
+        if ("手机".equals(intent)) {
+            return switch (dimension) {
+                case "function" -> "可直接告诉我优先级，例如“影像>续航>性能”或“性能>散热>手感”。";
+                case "scene" -> "不同场景权重差异很大：拍照、游戏、通勤和商务的选型完全不同。";
+                default -> "补齐这一项后，我会把主推和备选拉开差异，避免同质化推荐。";
+            };
+        }
+
+        if ("笔记本".equals(intent)) {
+            return switch (dimension) {
+                case "function" -> "建议先定取向：轻薄续航、性能释放、屏幕素质或接口扩展。";
+                case "scene" -> "办公、创作、开发、游戏对应的 CPU/GPU/散热策略不同。";
+                default -> "补齐这一项，我会给你“主力机 + 性价比备选”的组合。";
+            };
+        }
+
+        if ("家居家具".equals(intent)) {
+            return switch (dimension) {
+                case "appearance" -> "家居品类建议同时给风格和尺寸，这样推荐可以直接落地。";
+                case "function" -> "承重、易清洁和收纳效率通常比单纯颜值更影响长期体验。";
+                default -> "补充这一项后，我会优先筛掉尺寸不合适或材质不匹配的方案。";
+            };
+        }
+
+        if ("食品生鲜".equals(intent)) {
+            return switch (dimension) {
+                case "function" -> "食品建议先明确“低糖/高蛋白/提神/成分干净”等核心目标。";
+                case "scene" -> "办公室囤货、健身补给、家庭分享的包装与成分策略差异明显。";
+                default -> "补齐这一项后，我会优先避开不符合禁忌和口味方向的商品。";
+            };
+        }
+
+        return "补齐这一项后我就可以直接给你 2-3 个可买方案。";
     }
 
     private BigDecimal resolveBudget(String message, List<String> history) {
@@ -760,6 +1365,95 @@ public class AiShoppingAdvisorService {
         return "";
     }
 
+    private String resolveBrandPreference(String message, List<String> history, String intent, boolean isCategorySwitch) {
+        String current = detectBrandPreference(message);
+        if (!isBlank(current)) {
+            return current;
+        }
+        if (isCategorySwitch && !isBlank(intent)) {
+            return "";
+        }
+        for (String item : history) {
+            current = detectBrandPreference(item);
+            if (!isBlank(current)) {
+                return current;
+            }
+        }
+        return "";
+    }
+
+    private String detectBrandPreference(String text) {
+        String normalized = safe(text).toLowerCase(Locale.ROOT);
+        if (containsAny(normalized, List.of("跳过品牌", "品牌不限", "品牌都可以", "无品牌偏好", "不看品牌"))) {
+            return "品牌不限";
+        }
+        List<String> hits = BRAND_KEYWORDS.entrySet().stream()
+                .filter(entry -> entry.getValue().stream().anyMatch(normalized::contains))
+                .map(Map.Entry::getKey)
+                .limit(2)
+                .toList();
+        return hits.isEmpty() ? "" : String.join("/", hits);
+    }
+
+    private String resolveTypePreference(String message, List<String> history, String intent, boolean isCategorySwitch) {
+        String current = detectTypePreference(message);
+        if (!isBlank(current)) {
+            return current;
+        }
+        if (isCategorySwitch && !isBlank(intent)) {
+            return "";
+        }
+        for (String item : history) {
+            current = detectTypePreference(item);
+            if (!isBlank(current)) {
+                return current;
+            }
+        }
+        return "";
+    }
+
+    private String detectTypePreference(String text) {
+        String normalized = safe(text).toLowerCase(Locale.ROOT);
+        if (containsAny(normalized, List.of("跳过类型", "跳过佩戴", "类型不限", "佩戴不限", "都可以"))) {
+            return "类型不限";
+        }
+        List<String> hits = HEADPHONE_TYPE_KEYWORDS.entrySet().stream()
+                .filter(entry -> entry.getValue().stream().anyMatch(normalized::contains))
+                .map(Map.Entry::getKey)
+                .limit(2)
+                .toList();
+        return hits.isEmpty() ? "" : String.join("/", hits);
+    }
+
+    private String resolveColorPreference(String message, List<String> history, String intent, boolean isCategorySwitch) {
+        String current = detectColorPreference(message);
+        if (!isBlank(current)) {
+            return current;
+        }
+        if (isCategorySwitch && !isBlank(intent)) {
+            return "";
+        }
+        for (String item : history) {
+            current = detectColorPreference(item);
+            if (!isBlank(current)) {
+                return current;
+            }
+        }
+        return "";
+    }
+
+    private String detectColorPreference(String text) {
+        String normalized = safe(text).toLowerCase(Locale.ROOT);
+        if (containsAny(normalized, List.of("跳过颜色", "颜色不限", "颜色都可以", "无颜色偏好"))) {
+            return "颜色不限";
+        }
+        List<String> hits = COLOR_KEYWORDS.stream()
+                .filter(normalized::contains)
+                .limit(2)
+                .toList();
+        return hits.isEmpty() ? "" : String.join("/", hits);
+    }
+
     private String detectAppearancePreference(String text) {
         String normalized = safe(text).toLowerCase(Locale.ROOT);
         List<String> keywords = List.of("黑色", "白色", "简约", "商务", "运动风", "复古", "轻量", "小巧", "头戴", "入耳", "圆盘", "方盘", "宽松", "修身");
@@ -826,6 +1520,8 @@ public class AiShoppingAdvisorService {
             case "usage", "scene" -> List.of("场景", "通勤", "办公", "用途", "什么地方", "哪里用");
             case "function", "feature" -> List.of("功能", "看重", "需求", "偏好", "有什么要求", "什么功能");
             case "appearance", "style", "color" -> List.of("外观", "颜色", "风格", "外形", "什么色");
+            case "brand" -> List.of("品牌", "牌子", "生态", "apple", "索尼", "华为");
+            case "type" -> List.of("类型", "入耳", "半入耳", "头戴", "挂耳", "骨传导");
             default -> List.of(dimension);
         };
 
@@ -877,6 +1573,10 @@ public class AiShoppingAdvisorService {
                 || containsAny(normalized, List.of("看重", "需要", "要求", "防水", "续航", "降噪", "轻薄", "性能"));
             case "appearance", "style", "color" -> !isBlank(detectAppearancePreference(normalized))
                 || containsAny(normalized, List.of("颜色", "外观", "风格", "黑色", "白色", "简约", "商务"));
+            case "brand" -> !isBlank(detectBrandPreference(normalized))
+                || containsAny(normalized, List.of("品牌", "牌子", "索尼", "华为", "苹果", "小米"));
+            case "type" -> !isBlank(detectTypePreference(normalized))
+                || containsAny(normalized, List.of("入耳", "半入耳", "头戴", "挂耳", "骨传导"));
             case "category" -> !isBlank(detectIntent(normalized));
             default -> normalized.length() >= 2;
         };
@@ -1000,6 +1700,9 @@ public class AiShoppingAdvisorService {
                                                   String scene,
                                                   String functionPreference,
                                                   String appearancePreference,
+                                                  String brandPreference,
+                                                  String typePreference,
+                                                  String colorPreference,
                                                   String intent) {
         List<String> required = plan.requiredDimensions() == null || plan.requiredDimensions().isEmpty()
                 ? List.of("budget", "usage", "function")
@@ -1018,8 +1721,17 @@ public class AiShoppingAdvisorService {
                 case "function", "feature" -> {
                     if (isBlank(functionPreference)) missing.add("function");
                 }
-                case "appearance", "style", "color" -> {
+                case "appearance", "style" -> {
                     if (isBlank(appearancePreference)) missing.add("appearance");
+                }
+                case "brand" -> {
+                    if (isBlank(brandPreference)) missing.add("brand");
+                }
+                case "type" -> {
+                    if (isBlank(typePreference)) missing.add("type");
+                }
+                case "color" -> {
+                    if (isBlank(colorPreference)) missing.add("color");
                 }
                 default -> {
                     if (isBlank(intent)) missing.add("category");
@@ -1189,7 +1901,8 @@ public class AiShoppingAdvisorService {
     private String selectBestDimensionToAsk(List<String> missingDimensions,
                                            AdvisorKnowledgeBaseService.ClarificationPlan plan,
                                            List<ChatMessage> history,
-                                           String intent) {
+                                           String intent,
+                                           List<String> recentAskedDimensions) {
         // 【智能优先级策略】优先级从高到低：
         // 1. 使用知识库计划的必需维度顺序（品类特定优化）
         // 2. 跳过已最近被问过的维度
@@ -1199,10 +1912,16 @@ public class AiShoppingAdvisorService {
         List<String> filteredMissing = missingDimensions.stream()
                 .filter(item -> !hasAskedDimensionRecently(history, item, intent))
                 .toList();
-        
-        if (filteredMissing.isEmpty()) {
+
+        List<String> candidateMissing = filteredMissing.isEmpty() ? missingDimensions : filteredMissing;
+        if (candidateMissing.isEmpty()) {
             return "";
         }
+
+        Set<String> cooldownDimensions = recentAskedDimensions.stream()
+            .map(this::normalizeDimensionKey)
+            .filter(item -> !item.isBlank())
+            .collect(Collectors.toSet());
         
         // 【第1优先级】按知识库计划的必需维度顺序选择
         if (!requiredDimensions.isEmpty()) {
@@ -1216,15 +1935,17 @@ public class AiShoppingAdvisorService {
                         .findFirst()
                         .orElse(null);
                 if (matched != null) {
-                    return matched;
+                    if (!cooldownDimensions.contains(normalizeDimensionKey(matched))) {
+                        return matched;
+                    }
                 }
             }
         }
         
         // 【第2优先级】降级到全局优先级
-        String[] fallbackPriority = {"budget", "scene", "usage", "function", "feature", "appearance", "style", "preference"};
+        String[] fallbackPriority = {"budget", "scene", "usage", "brand", "type", "function", "feature", "color", "appearance", "style", "preference"};
         for (String priority : fallbackPriority) {
-            String dimension = filteredMissing.stream()
+            String dimension = candidateMissing.stream()
                     .filter(d -> {
                         String normalized = d.toLowerCase(Locale.ROOT);
                         return normalized.contains(priority) || priority.contains(normalized);
@@ -1232,13 +1953,81 @@ public class AiShoppingAdvisorService {
                     .findFirst()
                     .orElse(null);
             
-            if (dimension != null && !dimension.isBlank()) {
+            if (dimension != null && !dimension.isBlank() && !cooldownDimensions.contains(normalizeDimensionKey(dimension))) {
                 return dimension;
             }
         }
         
-        // 【第3优先级】返回第一个缺失维度
-        return filteredMissing.stream().findFirst().orElse("");
+        // 【第3优先级】冷却后仍无可选时，退化为任意缺失维度，防止会话卡住。
+        return candidateMissing.stream()
+                .filter(item -> !cooldownDimensions.contains(normalizeDimensionKey(item)))
+                .findFirst()
+                .orElse(candidateMissing.stream().findFirst().orElse(""));
+    }
+
+    private List<String> recentAskedDimensions(String sessionId) {
+        if (isBlank(sessionId)) {
+            return List.of();
+        }
+        Deque<String> deque = recentClarificationDimensionsBySession.get(sessionId);
+        if (deque == null) {
+            return List.of();
+        }
+        synchronized (deque) {
+            return List.copyOf(deque);
+        }
+    }
+
+    private void recordAskedDimension(String sessionId, String dimension) {
+        if (isBlank(sessionId) || isBlank(dimension)) {
+            return;
+        }
+        String normalized = normalizeDimensionKey(dimension);
+        if (normalized.isBlank()) {
+            return;
+        }
+        Deque<String> deque = recentClarificationDimensionsBySession
+                .computeIfAbsent(sessionId, ignored -> new ArrayDeque<>());
+        synchronized (deque) {
+            deque.remove(normalized);
+            deque.addLast(normalized);
+            while (deque.size() > CLARIFICATION_DIMENSION_COOLDOWN) {
+                deque.removeFirst();
+            }
+        }
+    }
+
+    private Set<UUID> recentRecommendedProductIds(String sessionId) {
+        if (isBlank(sessionId)) {
+            return Set.of();
+        }
+        Deque<UUID> deque = recentRecommendedProductsBySession.get(sessionId);
+        if (deque == null) {
+            return Set.of();
+        }
+        synchronized (deque) {
+            return Set.copyOf(deque);
+        }
+    }
+
+    private void recordRecommendedProducts(String sessionId, List<ChatRecommendationResponse> recommendations) {
+        if (isBlank(sessionId) || recommendations == null || recommendations.isEmpty()) {
+            return;
+        }
+        Deque<UUID> deque = recentRecommendedProductsBySession
+                .computeIfAbsent(sessionId, ignored -> new ArrayDeque<>());
+        synchronized (deque) {
+            for (ChatRecommendationResponse item : recommendations) {
+                if (item == null || item.productId() == null) {
+                    continue;
+                }
+                deque.remove(item.productId());
+                deque.addLast(item.productId());
+            }
+            while (deque.size() > RECOMMENDATION_PRODUCT_COOLDOWN) {
+                deque.removeFirst();
+            }
+        }
     }
 
     private String mergeContext(String message, List<String> recentUserMessages) {
@@ -1246,6 +2035,33 @@ public class AiShoppingAdvisorService {
             return safe(message);
         }
         return safe(message) + "\n" + String.join("\n", recentUserMessages);
+    }
+
+    private String ensureSummaryPreface(String reply,
+                                        String intent,
+                                        BigDecimal budget,
+                                        String scene,
+                                        String functionPreference,
+                                        String appearancePreference,
+                                        String brandPreference,
+                                        String typePreference,
+                                        String colorPreference) {
+        String text = safe(reply).trim();
+        if (text.contains("需求速览") || text.contains("主推") || text.contains("购买建议")) {
+            return text;
+        }
+        String summary = "【需求速览】"
+            + "品类=" + blankToDefault(intent, "通用导购")
+                + "，预算=" + budgetSummary(budget)
+                + "，场景=" + blankToDefault(scene, "未明确")
+                + "，品牌=" + blankToDefault(brandPreference, "未明确")
+                + "，类型=" + blankToDefault(typePreference, "未明确")
+                + "，功能=" + blankToDefault(functionPreference, "未明确")
+                + "，颜色=" + blankToDefault(colorPreference, "未明确");
+        if (text.isBlank()) {
+            return summary;
+        }
+        return summary + "\n" + text;
     }
 
     private String buildRuleBasedReply(String intent, BigDecimal budget, String scene, List<Product> products) {
@@ -1258,13 +2074,12 @@ public class AiShoppingAdvisorService {
             return "我先不盲推。你告诉我预算、使用场景和最看重的 1 个点（例如续航/轻薄/容量），我会马上给你精简到 1-3 款。";
         }
 
-        return "我先按你这轮需求，给你一版更贴近实际的导购建议：\n"
-            + "- 需求类型：" + blankToDefault(intent, "未明确品类") + "\n"
-            + "- 预算范围：" + budgetSummary(budget) + "\n"
-            + "- 使用场景：" + blankToDefault(scene, "未明确") + "\n\n"
-            + "我优先推荐这几款（已尽量避开重复定位）：\n"
-            + recommendation + "\n\n"
-            + "你如果补充一个偏好（品牌/尺寸/颜色/是否要轻量），我可以继续收敛成最终 1-2 款。";
+        return "【需求速览】品类=" + blankToDefault(intent, "未明确品类")
+            + "，预算=" + budgetSummary(budget)
+            + "，场景=" + blankToDefault(scene, "未明确") + "\n"
+            + "【主推/备选】我先给你 1-3 款可直接比较的商品：\n"
+            + recommendation + "\n"
+            + "【购买建议】如果你再补 1 个偏好（品牌/尺寸/颜色/材质），我可以收敛成最终 1-2 款并给下单顺序。";
     }
 
     private String detectedIntentLabel(String intent, String scene) {
@@ -1503,5 +2318,16 @@ public class AiShoppingAdvisorService {
         private static AiRuntimeStatus initial(String provider, String modelName) {
             return new AiRuntimeStatus(provider, modelName, false, "NOT_CALLED_YET", Instant.now(), 0);
         }
+    }
+
+    private record SessionRequirementProfile(String intent,
+                                             BigDecimal budget,
+                                             String scene,
+                                             String functionPreference,
+                                             String appearancePreference,
+                                             String brandPreference,
+                                             String typePreference,
+                                             String colorPreference,
+                                             Instant updatedAt) {
     }
 }

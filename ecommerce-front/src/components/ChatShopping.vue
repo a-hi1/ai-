@@ -129,7 +129,7 @@
                 <span class="timestamp">{{ formatTime(systemTimestamp) }}</span>
               </div>
               <div class="text assistant-text system-text">
-                <div v-for="(block, blockIndex) in formatAssistantBlocks('告诉我你想买什么，我会按品类追问预算、场景和细节偏好，再给出最合适的主推款、备选款，以及真正用得上的搭配推荐。')" :key="`system-${blockIndex}`" :class="['text-block', block.tone]">
+                <div v-for="(block, blockIndex) in formatAssistantBlocks('请先告诉我想购买的品类。我会按该品类的专业维度逐步确认需求，再给出主推、备选和购买建议。你可以直接回答，也可以输入“跳过预算”“跳过品牌”等，我会用知识库默认值补全并继续推荐。')" :key="`system-${blockIndex}`" :class="['text-block', block.tone]">
                   <span class="text-emoji">{{ block.emoji }}</span>
                   <span class="text-line" v-html="block.html"></span>
                 </div>
@@ -155,6 +155,27 @@
                 <span class="brief-one-line">{{ briefAssistantSentence(msg) }}</span>
               </div>
               <div v-if="msg.role === 'user'" class="text">{{ msg.content }}</div>
+
+              <div v-if="msg.role === 'assistant' && getRequirementPanel(msg)" class="requirement-panel">
+                <div class="requirement-head">
+                  <strong>需求完整度面板</strong>
+                  <span class="requirement-score">{{ getRequirementPanel(msg)?.completion }}</span>
+                </div>
+                <div class="requirement-grid">
+                  <div class="requirement-card ok">
+                    <span>已收集维度</span>
+                    <div class="chip-list">
+                      <span v-for="item in getRequirementPanel(msg)?.collected" :key="`c-${msg.timestamp}-${item}`" class="req-chip ok">{{ item }}</span>
+                    </div>
+                  </div>
+                  <div class="requirement-card missing">
+                    <span>缺失维度</span>
+                    <div class="chip-list">
+                      <span v-for="item in getRequirementPanel(msg)?.missing" :key="`m-${msg.timestamp}-${item}`" class="req-chip missing">{{ item }}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
 
               <div v-if="msg.goodsList?.length" class="result-showcase">
                 <div class="result-showcase-head">
@@ -255,16 +276,29 @@
             >
               ⚡ 快速模式
             </button>
+            <button
+              class="mode-btn direct-btn"
+              :disabled="sending"
+              @click="directRecommendNow"
+              title="跳过追问，直接给出当前品类推荐"
+            >
+              🎧 直接看推荐
+            </button>
           </div>
 
-          <div class="emoji-bar">
-            <button v-for="emoji in emojiSuggestions" :key="emoji" class="emoji-chip" type="button" @click="appendEmoji(emoji)">{{ emoji }}</button>
+          <div class="guided-shortcuts">
+            <span class="shortcut-label">可选跳过</span>
+            <button class="shortcut-chip" type="button" @click="applySkipShortcut('预算')">跳过预算</button>
+            <button class="shortcut-chip" type="button" @click="applySkipShortcut('场景')">跳过场景</button>
+            <button class="shortcut-chip" type="button" @click="applySkipShortcut('品牌')">跳过品牌</button>
+            <button class="shortcut-chip" type="button" @click="applySkipShortcut('功能')">跳过功能</button>
+            <button class="shortcut-chip" type="button" @click="applySkipShortcut('细节')">跳过细节</button>
           </div>
           <div class="input-main-row">
             <input
               v-model="inputValue"
               type="text"
-              placeholder="例如：预算 3000 元以内，帮我推荐适合通勤和视频会议的降噪耳机"
+              placeholder="例如：预算 3000 元以内，推荐适合通勤和视频会议的手机或耳机"
               class="chat-input"
               @keyup.enter="sendMessage"
             />
@@ -342,7 +376,6 @@ import {
   type ChatSessionRecord
 } from '../services/chatSessions'
 import {
-  emojiSuggestions,
   formatAssistantBlocks,
   localFallbackGoods,
   quickPrompts,
@@ -685,6 +718,61 @@ const hasDirectCommodityDemand = (text: string) => {
     || includesAny(text.toLowerCase(), ['mp3', '播放器', '随身听', '鼠标', 'keyboard', 'mouse', '耳机', '笔记本', '充电器'])
 }
 
+const SKIP_KEYWORD_MAPPINGS: Array<{ key: keyof GuidedRequirementProfile, label: string, keywords: string[] }> = [
+  { key: 'category', label: '品类', keywords: ['品类', '类别', '类型'] },
+  { key: 'budget', label: '预算', keywords: ['预算', '价格', '价位', '金额'] },
+  { key: 'usage', label: '场景', keywords: ['场景', '用途', '使用场景', '使用方式'] },
+  { key: 'brand', label: '品牌', keywords: ['品牌', '牌子'] },
+  { key: 'detailA', label: '功能', keywords: ['功能', '核心功能', '关键偏好'] },
+  { key: 'detailB', label: '细节', keywords: ['细节', '限制', '补充条件', '附加条件'] }
+]
+
+const parseSkipSelections = (rawMessage: string): Array<keyof GuidedRequirementProfile> => {
+  const text = rawMessage.toLowerCase()
+  return SKIP_KEYWORD_MAPPINGS
+    .filter(item => item.keywords.some(keyword => text.includes(`跳过${keyword}`) || text.includes(`不考虑${keyword}`) || text.includes(`不限制${keyword}`)))
+    .map(item => item.key)
+}
+
+const formatSkipLabels = (keys: Array<keyof GuidedRequirementProfile>) => {
+  const labels = keys
+    .map(key => SKIP_KEYWORD_MAPPINGS.find(item => item.key === key)?.label)
+    .filter((item): item is string => Boolean(item))
+
+  return Array.from(new Set(labels))
+}
+
+const applySkippedDefaults = (key: keyof GuidedRequirementProfile) => {
+  if (key === 'category' && !guidedProfile.value.category) {
+    guidedProfile.value.category = '商品'
+    return
+  }
+
+  if (key === 'budget' && guidedProfile.value.budget === null) {
+    guidedProfile.value.budget = 0
+    return
+  }
+
+  if (key === 'usage' && !guidedProfile.value.usage) {
+    guidedProfile.value.usage = '日常综合使用'
+    return
+  }
+
+  if (key === 'brand' && !guidedProfile.value.brand) {
+    guidedProfile.value.brand = '主流品牌均可'
+    return
+  }
+
+  if (key === 'detailA' && !guidedProfile.value.detailA) {
+    guidedProfile.value.detailA = '以主流综合体验优先'
+    return
+  }
+
+  if (key === 'detailB' && !guidedProfile.value.detailB) {
+    guidedProfile.value.detailB = '无额外限制'
+  }
+}
+
 const markGuidedStepSkipped = (key: keyof GuidedRequirementProfile) => {
   if (!guidedSkippedKeys.value.includes(key)) {
     guidedSkippedKeys.value.push(key)
@@ -810,16 +898,15 @@ const getGuidedCompletionScore = () => {
 
 const shouldFinalizeGuidedFlow = (latestMessage: string) => {
   const { coreFilled, extraFilled } = getGuidedCompletionScore()
+  const totalFilled = coreFilled + extraFilled
 
-  if (coreFilled >= 3) {
+  // 默认至少收集到 5/6 维度再结束引导，避免“问两句就推荐”。
+  if (totalFilled >= 5 && coreFilled >= 3) {
     return true
   }
 
-  if (coreFilled >= 2 && guidedQuestionCount.value >= 2) {
-    return true
-  }
-
-  if (guidedQuestionCount.value >= 4) {
+  // 兜底防止个别场景循环追问。
+  if (guidedQuestionCount.value >= 6 && coreFilled >= 2) {
     return true
   }
 
@@ -827,7 +914,7 @@ const shouldFinalizeGuidedFlow = (latestMessage: string) => {
     return true
   }
 
-  return extraFilled >= 2 && coreFilled >= 1
+  return false
 }
 
 const getNextGuidedStep = (): ({ key: keyof GuidedRequirementProfile, question: string, index: number }) | null => {
@@ -967,7 +1054,7 @@ const formatSalesLabel = (salesCount: number) => {
 const formatReasonLines = (goods: Goods) => {
   const raw = (goods.reason || '').trim()
   if (!raw) {
-    return []
+    return ['综合匹配你的当前需求场景，建议作为优先对比项']
   }
 
   return raw
@@ -975,6 +1062,37 @@ const formatReasonLines = (goods: Goods) => {
     .map(item => item.trim())
     .filter(Boolean)
     .slice(0, 3)
+}
+
+const insightValue = (msg: Message, label: string) => {
+  return msg.insights?.find(item => item.label === label)?.value?.trim() || ''
+}
+
+const parseDimensionList = (value: string) => {
+  const normalized = (value || '').trim()
+  if (!normalized || normalized === '无') {
+    return [] as string[]
+  }
+  return normalized
+    .split(/[、,，|/]/)
+    .map(item => item.trim())
+    .filter(Boolean)
+}
+
+const getRequirementPanel = (msg: Message) => {
+  const completion = insightValue(msg, '需求完整度')
+  const collected = parseDimensionList(insightValue(msg, '已收集维度'))
+  const missing = parseDimensionList(insightValue(msg, '缺失维度'))
+
+  if (!completion && collected.length === 0 && missing.length === 0) {
+    return null
+  }
+
+  return {
+    completion: completion || '未计算',
+    collected,
+    missing
+  }
 }
 
 const sanitizeGoodsTags = (tags?: string[]) => {
@@ -1055,8 +1173,24 @@ const usePrompt = (prompt: string) => {
   inputValue.value = prompt
 }
 
-const appendEmoji = (emoji: string) => {
-  inputValue.value = `${inputValue.value}${inputValue.value ? ' ' : ''}${emoji}`
+const directRecommendNow = () => {
+  const seed = inputValue.value.trim()
+  inputValue.value = seed
+    ? `${seed}，直接看推荐，跳过提问`
+    : '我想买一件商品，直接看推荐，跳过提问'
+  void sendMessage()
+}
+
+const applySkipShortcut = (target: string) => {
+  if (sending.value) {
+    return
+  }
+
+  const command = `跳过${target}`
+  const current = inputValue.value.trim()
+  inputValue.value = current
+    ? `${current}，${command}`
+    : command
 }
 
 const refreshSessionList = () => {
@@ -1119,7 +1253,7 @@ const ensureAiOpeningMessage = () => {
 
   messageList.value.push({
     role: 'assistant',
-    content: '你好呀，我是小选。我们一步一步来，我先了解你的需求再精准推荐。你这次想买什么品类？',
+    content: '你好，我是你的 AI 导购顾问。为保证推荐结果专业且可执行，我会按品类确认关键维度（预算、场景、功能、品牌与细节限制）。你可以逐项回答，也可以随时输入“跳过预算/跳过品牌/跳过细节”，我会按知识库主流偏好补齐并继续推荐。先告诉我你想买什么品类。',
     timestamp: new Date().toISOString(),
     detectedIntent: '需求采集中',
     budgetSummary: '预算待确认'
@@ -1264,11 +1398,35 @@ const mapRecommendation = (item: ChatRecommendationDto): Goods => ({
   price: item.price,
   desc: item.description || item.reason || '查看商品详情',
   image: item.imageUrl || `https://picsum.photos/seed/${item.productId}/480/320`,
-  reason: item.reason,
+  reason: (item.reason || '').trim() || buildFallbackReason(item),
   salesCount: item.salesCount,
   withinBudget: item.withinBudget,
   tags: sanitizeGoodsTags(item.tags ?? [])
 })
+
+const buildFallbackReason = (item: ChatRecommendationDto) => {
+  const lines: string[] = []
+
+  if (item.withinBudget) {
+    lines.push('价格在你的预算范围内，综合性价比更稳妥')
+  } else {
+    lines.push('价格略高于预算，适合做升级备选')
+  }
+
+  if ((item.tags ?? []).length) {
+    lines.push(`标签匹配：${item.tags.slice(0, 2).join(' / ')}`)
+  }
+
+  if (item.description?.trim()) {
+    lines.push(`场景适配：${item.description.trim()}`)
+  }
+
+  if (item.salesCount > 0) {
+    lines.push(`历史成交 ${item.salesCount} 件，反馈稳定`)
+  }
+
+  return lines.slice(0, 3).join('\n')
+}
 
 type ProductPreview = {
   id: string
@@ -1504,6 +1662,9 @@ const sendMessage = async () => {
   persistCurrentSession()
   scrollToBottom()
 
+  const explicitSkippedKeys = parseSkipSelections(inputVal)
+  const explicitSkipLabels = formatSkipLabels(explicitSkippedKeys)
+
   const currentCategory = detectCategoryFromText(inputVal)
   if (currentCategory && guidedProfile.value.category && currentCategory !== guidedProfile.value.category) {
     resetGuidedFlow()
@@ -1520,6 +1681,11 @@ const sendMessage = async () => {
   }
 
   if (guidedActive.value) {
+    explicitSkippedKeys.forEach((key) => {
+      markGuidedStepSkipped(key)
+      applySkippedDefaults(key)
+    })
+
     const currentStep = getGuidedSteps()[guidedStep.value]
 
     if (currentStep && isFuzzyUnknownAnswer(inputVal)) {
@@ -1550,13 +1716,16 @@ const sendMessage = async () => {
     }
   }
 
-  const requestMessage = guidedActive.value
+  const requestMessageSeed = guidedActive.value
     ? buildGuidedPrompt(inputVal)
     : inputVal
+  const requestMessage = explicitSkipLabels.length
+    ? `${requestMessageSeed}\n\n【用户已选择跳过】${explicitSkipLabels.join('、')}。这些维度请按主流偏好补全，并在结果中简要说明默认取值。`
+    : requestMessageSeed
 
   const draftAssistantMessage: Message = {
     role: 'assistant',
-    content: '我在理解你的需求，马上开始一步步确认。',
+    content: '',
     timestamp: new Date().toISOString()
   }
   messageList.value.push(draftAssistantMessage)
@@ -1566,29 +1735,28 @@ const sendMessage = async () => {
     let receivedFirstDelta = false
     let streamedFinalPayload = null as Awaited<ReturnType<typeof api.sendChatStream>>
     
-    // 根据模式选择API
-    const chatRes = adviceMode.value === 'quick'
-      ? await api.sendChatQuick(advisorUserId.value, requestMessage, activeSessionId.value)
-      : await api.sendChatStream(advisorUserId.value, requestMessage, activeSessionId.value, {
-          onStart: () => {
-            // keep placeholder visible while waiting first delta
-          },
-          onProgress: (progress) => {
-            syncAnalysisProgress(progress)
-          },
-          onDelta: (chunk) => {
-            if (!receivedFirstDelta) {
-              draftAssistantMessage.content = chunk
-              receivedFirstDelta = true
-            } else {
-              draftAssistantMessage.content += chunk
-            }
-            scrollToBottom()
-          },
-          onFinal: (payload) => {
-            streamedFinalPayload = payload
-          }
-        })
+    const modePrefix = adviceMode.value === 'quick'
+      ? '【回答偏好】请控制在 2-3 句核心建议，保持自然口语。\n'
+      : ''
+    const streamMessage = `${modePrefix}${requestMessage}`
+
+    const chatRes = await api.sendChatStream(advisorUserId.value, streamMessage, activeSessionId.value, {
+      onProgress: (progress) => {
+        syncAnalysisProgress(progress)
+      },
+      onDelta: (chunk) => {
+        if (!receivedFirstDelta) {
+          draftAssistantMessage.content = chunk
+          receivedFirstDelta = true
+        } else {
+          draftAssistantMessage.content += chunk
+        }
+        scrollToBottom()
+      },
+      onFinal: (payload) => {
+        streamedFinalPayload = payload
+      }
+    })
 
     const finalPayload = streamedFinalPayload || chatRes
     if (!finalPayload) {
@@ -2229,6 +2397,88 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
   line-height: 1.45;
 }
 
+.requirement-panel {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border-radius: 12px;
+  background: linear-gradient(180deg, #f5faf8 0%, #fffdfa 100%);
+  border: 1px solid #d9e8e1;
+}
+
+.requirement-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+
+.requirement-head strong {
+  font-size: 12px;
+  color: #205447;
+}
+
+.requirement-score {
+  font-size: 12px;
+  font-weight: 700;
+  color: #0d6b51;
+  background: #dff5ea;
+  padding: 4px 8px;
+  border-radius: 999px;
+}
+
+.requirement-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.requirement-card {
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border-radius: 10px;
+  border: 1px solid #e5ece8;
+  background: #ffffff;
+}
+
+.requirement-card span {
+  font-size: 11px;
+  color: #6f655a;
+  font-weight: 700;
+}
+
+.chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.req-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.req-chip.ok {
+  background: #e9f8f1;
+  color: #0e6f55;
+}
+
+.req-chip.missing {
+  background: #fff2ec;
+  color: #a6412e;
+}
+
+@media (max-width: 768px) {
+  .requirement-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 .status-stack {
   display: grid;
   gap: 8px;
@@ -2802,19 +3052,32 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
   flex-shrink: 0;
 }
 
-.emoji-bar {
+.guided-shortcuts {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+  align-items: center;
 }
 
-.emoji-chip {
-  min-width: 38px;
+.shortcut-label {
+  font-size: 12px;
+  color: #6b7280;
+  font-weight: 500;
+}
+
+.shortcut-chip {
   padding: 6px 10px;
   border-radius: 999px;
   border: 1px solid #e4d8c9;
   background: #fff;
   cursor: pointer;
+  font-size: 12px;
+  color: #374151;
+}
+
+.shortcut-chip:hover {
+  border-color: #1f6f5c;
+  color: #1f6f5c;
 }
 
 .input-row {

@@ -70,17 +70,32 @@ public class ChatController {
     public Flux<ServerSentEvent<String>> stream(@Validated @RequestBody ChatRequest request) {
         UUID userId = request.resolvedUserId();
         String sessionId = request.resolvedSessionId();
-        Flux<ServerSentEvent<String>> earlyEvents = Flux.just(
-            buildEvent("start", "accepted"),
-            buildEvent("progress", toJson(new StreamProgress(1, 3, "Agent 正在理解需求")))
-        );
+        return Flux.create(emitter -> {
+            emitter.next(buildEvent("start", "accepted"));
+            emitter.next(buildEvent("progress", toJson(new StreamProgress(1, 3, "Agent 正在理解需求"))));
 
-        Flux<ServerSentEvent<String>> replyEvents = chatService.saveUserMessage(userId, sessionId, request.message())
-            .then(chatService.generateReply(userId, request.message(), sessionId))
-            .flatMapMany(advice -> toStream(userId, sessionId, advice));
-
-        return Flux.concat(earlyEvents, replyEvents)
-                .onErrorResume(error -> Flux.just(buildEvent("error", summarizeError(error))));
+            chatService.saveUserMessage(userId, sessionId, request.message())
+                    .then(chatService.generateReplyStream(userId, request.message(), sessionId,
+                            token -> emitter.next(buildEvent("delta", token))))
+                    .flatMap(advice -> {
+                        List<String> progressSteps = buildAgentProgressSteps(advice.insights());
+                        for (int i = 0; i < progressSteps.size(); i++) {
+                            emitter.next(buildEvent("progress", toJson(new StreamProgress(i + 1, progressSteps.size(), progressSteps.get(i)))));
+                        }
+                        return toResponse(userId, sessionId, advice);
+                    })
+                    .subscribe(
+                            response -> {
+                                emitter.next(buildEvent("final", toJson(response)));
+                                emitter.next(buildEvent("done", "[DONE]"));
+                                emitter.complete();
+                            },
+                            error -> {
+                                emitter.next(buildEvent("error", summarizeError(error)));
+                                emitter.complete();
+                            }
+                    );
+        });
     }
 
     private Mono<ChatResponse> toResponse(UUID userId, String sessionId, ChatAdvicePayload advice) {
@@ -110,13 +125,12 @@ public class ChatController {
                             advice.fallback());
 
                     String fullText = saved.getContent() == null ? "" : saved.getContent();
-                    List<String> chunks = splitChunks(fullText);
+                    List<String> chunks = splitChars(fullText);
                     List<String> progressSteps = buildAgentProgressSteps(advice.insights());
                     Flux<ServerSentEvent<String>> progress = Flux.fromStream(
                                     IntStream.range(0, progressSteps.size())
                                             .mapToObj(index -> buildEvent("progress", toJson(new StreamProgress(index + 1, progressSteps.size(), progressSteps.get(index)))))
-                            )
-                            .delayElements(Duration.ofMillis(18));
+                            );
                     Flux<ServerSentEvent<String>> stream = Flux.fromIterable(chunks)
                             .delayElements(Duration.ofMillis(resolveDelay(fullText.length())))
                             .map(chunk -> buildEvent("delta", chunk));
@@ -158,41 +172,22 @@ public class ChatController {
 
     private int resolveDelay(int length) {
         if (length > 520) {
-            return 3;
+            return 1;
         }
         if (length > 260) {
-            return 5;
+            return 2;
         }
-        return 6;
+        return 2;
     }
 
-    private List<String> splitChunks(String text) {
+    private List<String> splitChars(String text) {
         if (text == null || text.isBlank()) {
             return List.of();
         }
 
-        List<String> chunks = new ArrayList<>();
-        int step = text.length() > 520 ? 12 : text.length() > 260 ? 9 : 7;
-        int cursor = 0;
-
-        while (cursor < text.length()) {
-            char current = text.charAt(cursor);
-            if (isPunctuation(current)) {
-                chunks.add(String.valueOf(current));
-                cursor += 1;
-                continue;
-            }
-
-            int end = Math.min(text.length(), cursor + step);
-            chunks.add(text.substring(cursor, end));
-            cursor = end;
-        }
-
-        return chunks;
-    }
-
-    private boolean isPunctuation(char value) {
-        return "，。！？；：,.!?;:".indexOf(value) >= 0;
+        List<String> chars = new ArrayList<>();
+        text.codePoints().forEach(codePoint -> chars.add(new String(Character.toChars(codePoint))));
+        return chars;
     }
 
     private ServerSentEvent<String> buildEvent(String event, String data) {

@@ -2,6 +2,7 @@ package com.example.ecommerce.service;
 
 import java.time.Instant;
 import java.util.UUID;
+import java.util.function.Consumer;
 
 import org.springframework.data.r2dbc.core.R2dbcEntityTemplate;
 import org.springframework.stereotype.Service;
@@ -43,6 +44,20 @@ public class ChatService {
         return skillRegistry.handleSkill(message)
                 .map(reply -> new ChatAdvicePayload(reply, java.util.List.of(), java.util.List.of(), java.util.List.of(), "技能指令", "未设置", false))
                 .switchIfEmpty(aiShoppingAdvisorService.advise(userId, message, sessionId));
+    }
+
+    public Mono<ChatAdvicePayload> generateReplyStream(UUID userId,
+                                                       String message,
+                                                       String sessionId,
+                                                       Consumer<String> tokenConsumer) {
+        return skillRegistry.handleSkill(message)
+                .map(reply -> {
+                    if (tokenConsumer != null && reply != null) {
+                        reply.codePoints().forEach(codePoint -> tokenConsumer.accept(new String(Character.toChars(codePoint))));
+                    }
+                    return new ChatAdvicePayload(reply, java.util.List.of(), java.util.List.of(), java.util.List.of(), "技能指令", "未设置", false);
+                })
+                .switchIfEmpty(aiShoppingAdvisorService.adviseStream(userId, message, sessionId, tokenConsumer));
     }
 
     public Mono<ChatAdvicePayload> generateQuickReply(UUID userId, String message, String sessionId) {
