@@ -86,7 +86,7 @@
 
       <div v-if="filteredProducts.length" class="result-grid">
         <article
-          v-for="product in getSearchResultVisibleProducts()"
+          v-for="product in searchResultVisibleProducts"
           :key="product.id"
           class="product-card clickable-card"
           role="link"
@@ -128,9 +128,9 @@
         </div>
 
         <div class="pagination">
-          <button class="pagination-btn" :disabled="getSearchResultPage() <= 1" @click="goPreviousSearchPage">上一页</button>
-          <span class="pagination-info">第 {{ getSearchResultPage() }} / {{ Math.max(1, getSearchResultTotalPages()) }} 页</span>
-          <button class="pagination-btn" :disabled="getSearchResultPage() >= getSearchResultTotalPages()" @click="goNextSearchPage">下一页</button>
+          <button class="pagination-btn" :disabled="searchCurrentPage <= 1" @click="goPreviousSearchPage">上一页</button>
+          <span class="pagination-info">第 {{ searchCurrentPage }} / {{ searchResultTotalPages }} 页</span>
+          <button class="pagination-btn" :disabled="searchCurrentPage >= searchResultTotalPages" @click="goNextSearchPage">下一页</button>
         </div>
       </div>
 
@@ -258,23 +258,19 @@ const getTotalPages = (products: ProductDto[]): number => {
   return Math.ceil(products.length / ITEMS_PER_PAGE)
 }
 
-const getSearchResultPage = (): number => {
-  return searchCurrentPage.value
-}
+const searchResultTotalPages = computed(() => {
+  return Math.max(1, Math.ceil(filteredProducts.value.length / searchPageSize.value))
+})
 
-const getSearchResultTotalPages = (): number => {
-  return Math.ceil(filteredProducts.value.length / searchPageSize.value)
-}
-
-const getSearchResultVisibleProducts = (): ProductDto[] => {
-  const currentPage = getSearchResultPage()
+const searchResultVisibleProducts = computed((): ProductDto[] => {
+  const currentPage = searchCurrentPage.value
   const startIdx = (currentPage - 1) * searchPageSize.value
   const endIdx = startIdx + searchPageSize.value
   return filteredProducts.value.slice(startIdx, endIdx)
-}
+})
 
 const setSearchPage = (page: number) => {
-  searchCurrentPage.value = Math.max(1, Math.min(page, getSearchResultTotalPages()))
+  searchCurrentPage.value = Math.max(1, Math.min(page, searchResultTotalPages.value))
 }
 
 const goPreviousSearchPage = () => {
@@ -298,15 +294,14 @@ const filteredProducts = computed(() => {
   const min = Number(minPrice.value)
   const max = Number(maxPrice.value)
 
-  const matchedProducts = allProducts.value.filter(product => {
-    const matchesSelectedCategory = !selectedCategoryId.value || categoryGroups.value
-      .find(group => group.category.id === selectedCategoryId.value)
-      ?.products.some(item => item.id === product.id)
+  const selectedIds = selectedCategoryProductIds.value
 
+  const matchedProducts = allProducts.value.filter(product => {
+    const matchesSelectedCategory = !selectedIds || selectedIds.has(product.id)
     const matchesKeywordSearch = !searchKeyword || productMatchesKeyword(product, searchKeyword)
     const matchesMinPrice = !minPrice.value || (!Number.isNaN(min) && product.price >= min)
     const matchesMaxPrice = !maxPrice.value || (!Number.isNaN(max) && product.price <= max)
-    return Boolean(matchesSelectedCategory) && matchesKeywordSearch && matchesMinPrice && matchesMaxPrice
+    return matchesSelectedCategory && matchesKeywordSearch && matchesMinPrice && matchesMaxPrice
   })
 
   return [...matchedProducts].sort((left, right) => {
@@ -321,6 +316,19 @@ const filteredProducts = computed(() => {
     }
     return 0
   })
+})
+
+const selectedCategoryProductIds = computed<Set<string> | null>(() => {
+  if (!selectedCategoryId.value) {
+    return null
+  }
+
+  const group = categoryGroups.value.find(item => item.category.id === selectedCategoryId.value)
+  if (!group) {
+    return new Set<string>()
+  }
+
+  return new Set(group.products.map(product => product.id))
 })
 
 const hasActiveFilter = computed(() => Boolean(
@@ -415,6 +423,25 @@ const openProduct = (product: ProductDto) => {
   router.push(`/products/${product.id}`)
 }
 
+const isSameQuery = (nextQuery: Record<string, string>) => {
+  const currentQuery: Record<string, string> = {}
+
+  Object.entries(route.query).forEach(([key, value]) => {
+    const singleValue = typeof value === 'string' ? value : Array.isArray(value) ? value[0] : undefined
+    if (typeof singleValue === 'string' && singleValue) {
+      currentQuery[key] = singleValue
+    }
+  })
+
+  const nextKeys = Object.keys(nextQuery)
+  const currentKeys = Object.keys(currentQuery)
+  if (nextKeys.length !== currentKeys.length) {
+    return false
+  }
+
+  return nextKeys.every(key => currentQuery[key] === nextQuery[key])
+}
+
 const syncQuery = () => {
   const nextQuery: Record<string, string> = {}
   if (selectedCategoryId.value) {
@@ -435,6 +462,11 @@ const syncQuery = () => {
   if (keyword.value.trim()) {
     nextQuery.pageSize = String(searchPageSize.value)
   }
+
+  if (isSameQuery(nextQuery)) {
+    return
+  }
+
   void router.replace({ path: '/shop', query: nextQuery })
 }
 
@@ -520,6 +552,10 @@ onMounted(async () => {
 
 watch(() => route.query, () => {
   applyRouteQuery()
+})
+
+watch([filteredProducts, searchPageSize], () => {
+  setSearchPage(searchCurrentPage.value)
 })
 
 onBeforeUnmount(() => {
