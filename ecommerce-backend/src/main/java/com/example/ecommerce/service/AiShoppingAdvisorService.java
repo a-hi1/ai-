@@ -64,12 +64,15 @@ public class AiShoppingAdvisorService {
     private static final String HEADPHONE_INTENT = "耳机";
     private static final List<String> GENERIC_ACCEPT_WORDS = List.of("都可以", "随便", "无所谓", "你定", "你决定", "没要求", "一般就行");
     private static final List<String> DIRECT_RECOMMEND_WORDS = List.of("直接推荐", "直接看推荐", "直接给我", "跳过提问", "不用问了", "不想回答", "先给推荐");
+    private static final List<String> API_ONLY_TRIGGER_WORDS = List.of("只靠api", "纯api", "api模式", "不用知识库", "不使用知识库", "关闭知识库");
     private static final int MIN_REQUIRED_DIMENSIONS_TO_RECOMMEND = 3;
     private static final int MIN_REQUIRED_DIMENSIONS_WITHOUT_AI = 4;
     private static final int MAX_CLARIFICATION_TURNS = 3;
     private static final int MIN_CLARIFICATION_TURNS = 1;
     private static final int CLARIFICATION_DIMENSION_COOLDOWN = 3;
     private static final int RECOMMENDATION_PRODUCT_COOLDOWN = 10;
+    private static final int STREAM_RETRIEVAL_TOP_K = 10;
+    private static final int STREAM_EMIT_CHUNK_SIZE = 24;
     private static final List<String> FOLLOW_UP_WORDS = List.of("这个", "这个吧", "就这个", "可以", "行", "好", "按你说的", "继续", "嗯", "对", "是的");
     private static final List<String> CATEGORY_SWITCH_SIGNALS = List.of("换个", "改要", "还想要", "另外要", "再要", "还要一个", "我再问", "对了", "顺便问", "帮我也");
         private static final Map<String, List<String>> BRAND_KEYWORDS = Map.ofEntries(
@@ -128,7 +131,6 @@ public class AiShoppingAdvisorService {
     private final OrderItemRepository orderItemRepository;
     private final ProductRepository productRepository;
     private final ShoppingAdvisorTools shoppingAdvisorTools;
-    @SuppressWarnings("unused")
     private final AdvisorToolContext advisorToolContext;
     private final ObjectMapper objectMapper;
     private final WebClient.Builder webClientBuilder;
@@ -198,7 +200,7 @@ public class AiShoppingAdvisorService {
 
             return Mono.zip(
                     chatMessageRepository.findByUserIdAndSessionId(userId, effectiveSessionId).collectList(),
-                    retrievalGatewayService.search(message, 16, null, null).collectList(),
+                    retrievalGatewayService.search(message, STREAM_RETRIEVAL_TOP_K, null, null).collectList(),
                     productRepository.findAll().collectList(),
                     orderItemRepository.findAll().collectList())
                 .flatMap(tuple -> Mono.fromCallable(() -> buildAdvice(userId, message, effectiveSessionId, tuple.getT1(), tuple.getT2(), tuple.getT3(), tuple.getT4(), tokenConsumer))
@@ -369,18 +371,27 @@ public class AiShoppingAdvisorService {
                 case "scene" -> {
                     if (isBlank(scene) && !raw.isBlank()) {
                         String inferred = detectScene(raw);
+                        if (isBlank(inferred) && containsAny(raw.toLowerCase(Locale.ROOT), List.of("都可以", "不限", "随便", "无所谓", "你定"))) {
+                            inferred = defaultSceneByIntent(intent);
+                        }
                         scene = isBlank(inferred) ? raw : inferred;
                     }
                 }
                 case "function" -> {
                     if (isBlank(functionPreference) && !raw.isBlank()) {
                         String inferred = detectFunctionPreference(raw);
+                        if (isBlank(inferred) && containsAny(raw.toLowerCase(Locale.ROOT), List.of("都可以", "不限", "随便", "无所谓", "你定"))) {
+                            inferred = defaultFunctionByIntent(intent);
+                        }
                         functionPreference = isBlank(inferred) ? raw : inferred;
                     }
                 }
                 case "appearance" -> {
                     if (isBlank(appearancePreference) && !raw.isBlank()) {
                         String inferred = detectAppearancePreference(raw);
+                        if (isBlank(inferred) && containsAny(raw.toLowerCase(Locale.ROOT), List.of("都可以", "不限", "随便", "无所谓", "你定"))) {
+                            inferred = "主流通用风格";
+                        }
                         appearancePreference = isBlank(inferred) ? raw : inferred;
                     }
                 }
@@ -434,15 +445,22 @@ public class AiShoppingAdvisorService {
             }
         }
 
-        List<AdvisorKnowledgeBaseService.KnowledgeSnippet> snippets = advisorKnowledgeBaseService
-                .search(mergedUserContext, 4);
-        AdvisorKnowledgeBaseService.ClarificationPlan plan = advisorKnowledgeBaseService
-                .resolveClarificationPlan(intent, snippets);
+        boolean knowledgeBaseEnabled = shouldUseKnowledgeBase(message);
+        List<AdvisorKnowledgeBaseService.KnowledgeSnippet> snippets = knowledgeBaseEnabled
+            ? advisorKnowledgeBaseService.search(mergedUserContext, 4)
+            : List.of();
+        AdvisorKnowledgeBaseService.ClarificationPlan plan = knowledgeBaseEnabled
+            ? advisorKnowledgeBaseService.resolveClarificationPlan(intent, snippets)
+            : buildApiOnlyClarificationPlan(intent);
 
         List<String> requiredDimensions = resolveRequiredDimensions(plan);
 
         List<String> missingDimensions = resolveMissingDimensions(plan, budget, scene, functionPreference, appearancePreference,
             brandPreference, typePreference, colorPreference, intent);
+        List<String> collectedDimensions = resolveCollectedDimensions(requiredDimensions, missingDimensions);
+        int completionPercent = calculateCompletionPercent(requiredDimensions, collectedDimensions);
+        int recentClarificationTurns = countRecentClarificationTurns(contextualHistory);
+        int adaptiveMaxTurns = calculateAdaptiveMaxTurns(plan, missingDimensions, snippets);
         boolean directRecommendation = wantsDirectRecommendation(message, inferenceHistory);
 
         if (directRecommendation) {
@@ -468,6 +486,38 @@ public class AiShoppingAdvisorService {
             }
             missingDimensions = resolveMissingDimensions(plan, budget, scene, functionPreference, appearancePreference,
                     brandPreference, typePreference, colorPreference, intent);
+            collectedDimensions = resolveCollectedDimensions(requiredDimensions, missingDimensions);
+            completionPercent = calculateCompletionPercent(requiredDimensions, collectedDimensions);
+        }
+
+        boolean enoughForFastRecommendation = collectedDimensions.size() >= minRequiredCollectedForRecommendation(requiredDimensions);
+        if (!directRecommendation
+                && !missingDimensions.isEmpty()
+                && enoughForFastRecommendation
+                && recentClarificationTurns >= adaptiveMaxTurns) {
+            if (isBlank(scene)) {
+                scene = defaultSceneByIntent(intent);
+            }
+            if (isBlank(functionPreference)) {
+                functionPreference = defaultFunctionByIntent(intent);
+            }
+            if (isBlank(appearancePreference)) {
+                appearancePreference = "主流通用风格";
+            }
+            if (isBlank(brandPreference)) {
+                brandPreference = "主流品牌均可";
+            }
+            if (isBlank(typePreference) && HEADPHONE_INTENT.equals(intent)) {
+                typePreference = "类型不限";
+            }
+            if (isBlank(colorPreference) && HEADPHONE_INTENT.equals(intent)) {
+                colorPreference = "颜色不限";
+            }
+
+            missingDimensions = resolveMissingDimensions(plan, budget, scene, functionPreference, appearancePreference,
+                    brandPreference, typePreference, colorPreference, intent);
+            collectedDimensions = resolveCollectedDimensions(requiredDimensions, missingDimensions);
+            completionPercent = calculateCompletionPercent(requiredDimensions, collectedDimensions);
         }
 
             requirementProfileBySession.put(sessionId, new SessionRequirementProfile(
@@ -488,10 +538,8 @@ public class AiShoppingAdvisorService {
                 dimensionToAsk = "preference";
             }
             recordAskedDimension(sessionId, dimensionToAsk);
-            List<String> collectedDimensions = resolveCollectedDimensions(requiredDimensions, missingDimensions);
-            int completionPercent = calculateCompletionPercent(requiredDimensions, collectedDimensions);
             return buildClarificationPayload(intent, budget, dimensionToAsk, plan, snippets,
-                    collectedDimensions, missingDimensions, completionPercent, retrievalChunks);
+                    collectedDimensions, missingDimensions, completionPercent, retrievalChunks, knowledgeBaseEnabled);
         }
 
         recentClarificationDimensionsBySession.remove(sessionId);
@@ -509,7 +557,7 @@ public class AiShoppingAdvisorService {
                     reply,
                     List.of(),
                     List.of(),
-                    buildInsights(intent, budget, snippets, true, "商品库无匹配结果", retrievalChunks),
+                    buildInsights(intent, budget, snippets, true, "商品库无匹配结果", retrievalChunks, knowledgeBaseEnabled),
                     detectedIntentLabel(intent, scene),
                     budgetSummary(budget),
                     true);
@@ -534,7 +582,7 @@ public class AiShoppingAdvisorService {
                 recommendations,
                 List.of(),
                 appendCompletenessInsights(
-                buildInsights(intent, budget, snippets, false, activeModelLabel(), retrievalChunks),
+                buildInsights(intent, budget, snippets, false, activeModelLabel(), retrievalChunks, knowledgeBaseEnabled),
                         requiredDimensions,
                         List.of()),
                 detectedIntentLabel(intent, scene),
@@ -582,7 +630,8 @@ public class AiShoppingAdvisorService {
                                                         List<String> collectedDimensions,
                                                         List<String> missingDimensions,
                                                         int completionPercent,
-                                                        List<RetrievalGatewayService.RetrievalChunk> retrievalChunks) {
+                                                        List<RetrievalGatewayService.RetrievalChunk> retrievalChunks,
+                                                        boolean knowledgeBaseEnabled) {
         String question = buildProfessionalClarificationQuestion(intent, missingDimension, plan, snippets);
         if (question.isBlank()) {
             question = "我先补一个关键信息，这样推荐不会跑偏：你最在意预算、场景还是功能？";
@@ -590,6 +639,7 @@ public class AiShoppingAdvisorService {
 
         List<ChatInsightResponse> insights = new ArrayList<>();
         insights.add(new ChatInsightResponse("导购阶段", "需求补全中"));
+        insights.add(new ChatInsightResponse("引导来源", knowledgeBaseEnabled ? "知识库增强 + API数据" : "API数据驱动（无知识库）"));
         insights.add(new ChatInsightResponse("待确认维度", missingDimension));
         insights.add(new ChatInsightResponse("知识库命中", String.valueOf(snippets.size())));
         insights.add(new ChatInsightResponse("需求完整度", completionPercent + "%"));
@@ -711,9 +761,14 @@ public class AiShoppingAdvisorService {
         try {
             ShoppingAdvisorAiService toolService = getOrCreateShoppingAdvisorAiService();
             if (toolService != null) {
-                String text = normalizeReply(toolService.chat(conversationId, prompt));
-                if (text != null) {
-                    return text;
+                advisorToolContext.begin(userId, prompt);
+                try {
+                    String text = normalizeReply(toolService.chat(conversationId, prompt));
+                    if (text != null) {
+                        return text;
+                    }
+                } finally {
+                    advisorToolContext.clear();
                 }
             }
         } catch (Exception error) {
@@ -753,6 +808,13 @@ public class AiShoppingAdvisorService {
                                                         List<AdvisorKnowledgeBaseService.KnowledgeSnippet> snippets,
                                                         String sessionId,
                                                         Consumer<String> tokenConsumer) {
+        if (shouldStreamWithTools()) {
+            String fullReply = generateRecommendationReply(userId, message, history, budget, scene, intent,
+                    functionPreference, appearancePreference, brandPreference, typePreference, colorPreference, products, snippets, sessionId);
+            emitReplyInChunks(fullReply, tokenConsumer);
+            return fullReply;
+        }
+
                                 String prompt = buildRecommendationPrompt(message, history, budget, scene, intent, functionPreference, appearancePreference,
                                     brandPreference, typePreference, colorPreference, products, snippets);
 
@@ -766,10 +828,55 @@ public class AiShoppingAdvisorService {
         // 流式失败时回退到同步路径，并用字符级回调保持前端流式体验不中断。
         String fallback = generateRecommendationReply(userId, message, history, budget, scene, intent,
             functionPreference, appearancePreference, brandPreference, typePreference, colorPreference, products, snippets, sessionId);
-        if (fallback != null && tokenConsumer != null) {
-            fallback.codePoints().forEach(codePoint -> tokenConsumer.accept(new String(Character.toChars(codePoint))));
-        }
+        emitReplyInChunks(fallback, tokenConsumer);
         return fallback;
+    }
+
+    private void emitReplyInChunks(String reply, Consumer<String> tokenConsumer) {
+        if (reply == null || tokenConsumer == null) {
+            return;
+        }
+        int length = reply.length();
+        for (int index = 0; index < length; index += STREAM_EMIT_CHUNK_SIZE) {
+            int end = Math.min(length, index + STREAM_EMIT_CHUNK_SIZE);
+            tokenConsumer.accept(reply.substring(index, end));
+        }
+    }
+
+    private boolean shouldUseKnowledgeBase(String message) {
+        AiProperties.Advisor advisor = aiProperties.getAdvisor();
+        if (advisor != null) {
+            if (advisor.isApiOnlyMode() || !advisor.isKnowledgeBaseEnabled()) {
+                return false;
+            }
+        }
+        String normalized = safe(message).toLowerCase(Locale.ROOT);
+        return !containsAny(normalized, API_ONLY_TRIGGER_WORDS);
+    }
+
+    private boolean shouldStreamWithTools() {
+        AiProperties.Advisor advisor = aiProperties.getAdvisor();
+        if (advisor == null) {
+            return true;
+        }
+        return advisor.isStreamWithTools();
+    }
+
+    private AdvisorKnowledgeBaseService.ClarificationPlan buildApiOnlyClarificationPlan(String intent) {
+        List<String> required = switch (safe(intent)) {
+            case "耳机" -> List.of("budget", "scene", "brand", "type", "function", "color");
+            case "手机", "笔记本", "平板", "电子数码" -> List.of("budget", "scene", "function", "brand", "appearance");
+            default -> List.of("budget", "scene", "function", "appearance");
+        };
+
+        return new AdvisorKnowledgeBaseService.ClarificationPlan(
+                "我先确认你的目标品类，再开始精准筛选。",
+                "预算大概在什么区间？例如 300 内、300-800、800+。",
+                "主要使用场景是什么？例如通勤、办公、家用、运动或送礼。",
+                "你最看重哪些功能？可以直接说优先级，比如“降噪>续航>音质”。",
+                "外观/类型/颜色有什么偏好吗？没有也可以直接说“都可以”。",
+                "还有品牌或其他限制吗？无偏好可说“品牌不限”。",
+                required);
     }
 
     private String buildRecommendationPrompt(String message,
@@ -1087,15 +1194,16 @@ public class AiShoppingAdvisorService {
                                                     List<AdvisorKnowledgeBaseService.KnowledgeSnippet> snippets,
                                                     boolean fallback,
                                                     String detail,
-                                                    List<RetrievalGatewayService.RetrievalChunk> retrievalChunks) {
+                                                    List<RetrievalGatewayService.RetrievalChunk> retrievalChunks,
+                                                    boolean knowledgeBaseEnabled) {
         List<ChatInsightResponse> insights = new ArrayList<>();
         insights.add(new ChatInsightResponse("AI模式", fallback ? "规则兜底" : "实时模型"));
         insights.add(new ChatInsightResponse(fallback ? "兜底原因" : "模型信息", detail));
-        insights.add(new ChatInsightResponse("知识库来源", advisorKnowledgeBaseService.knowledgeSourceLabel()));
+        insights.add(new ChatInsightResponse("知识库来源", knowledgeBaseEnabled ? advisorKnowledgeBaseService.knowledgeSourceLabel() : "已关闭（API模式）"));
         insights.add(new ChatInsightResponse("需求类型", blankToDefault(intent, "未识别")));
         insights.add(new ChatInsightResponse("预算范围", budgetSummary(budget)));
         insights.add(new ChatInsightResponse("知识库命中", String.valueOf(snippets.size())));
-        insights.add(new ChatInsightResponse("知识库向量检索", "已启用（哈希向量 + 关键词混合召回）"));
+        insights.add(new ChatInsightResponse("知识库向量检索", knowledgeBaseEnabled ? "已启用（哈希向量 + 关键词混合召回）" : "未启用（本轮API模式）"));
         if (!snippets.isEmpty()) {
             String topic = snippets.stream()
                     .limit(3)
@@ -1896,6 +2004,17 @@ public class AiShoppingAdvisorService {
         }
         
         return baseMax;
+    }
+
+    private int minRequiredCollectedForRecommendation(List<String> requiredDimensions) {
+        int total = normalizeDimensions(requiredDimensions).size();
+        if (total >= 6) {
+            return 4;
+        }
+        if (total >= 4) {
+            return 3;
+        }
+        return Math.max(2, total);
     }
 
     private String selectBestDimensionToAsk(List<String> missingDimensions,

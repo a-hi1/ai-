@@ -22,8 +22,10 @@ import java.util.stream.Collectors;
 import org.springframework.stereotype.Component;
 
 import com.example.ecommerce.model.ChatMessage;
+import com.example.ecommerce.model.CartItem;
 import com.example.ecommerce.model.OrderItem;
 import com.example.ecommerce.model.Product;
+import com.example.ecommerce.repository.CartItemRepository;
 import com.example.ecommerce.repository.ChatMessageRepository;
 import com.example.ecommerce.repository.OrderItemRepository;
 import com.example.ecommerce.repository.ProductRepository;
@@ -40,17 +42,20 @@ public class ShoppingAdvisorTools {
 
     private final ProductVectorStoreService productVectorStoreService;
     private final ProductRepository productRepository;
+    private final CartItemRepository cartItemRepository;
     private final OrderItemRepository orderItemRepository;
     private final ChatMessageRepository chatMessageRepository;
     private final AdvisorToolContext advisorToolContext;
 
     public ShoppingAdvisorTools(ProductVectorStoreService productVectorStoreService,
                                 ProductRepository productRepository,
+                                CartItemRepository cartItemRepository,
                                 OrderItemRepository orderItemRepository,
                                 ChatMessageRepository chatMessageRepository,
                                 AdvisorToolContext advisorToolContext) {
         this.productVectorStoreService = productVectorStoreService;
         this.productRepository = productRepository;
+        this.cartItemRepository = cartItemRepository;
         this.orderItemRepository = orderItemRepository;
         this.chatMessageRepository = chatMessageRepository;
         this.advisorToolContext = advisorToolContext;
@@ -76,6 +81,82 @@ public class ShoppingAdvisorTools {
         products = products == null ? List.of() : products;
         advisorToolContext.recordProducts("searchProductsWithinBudget", products);
         return formatProducts(products, "products within budget " + budget.stripTrailingZeros().toPlainString());
+    }
+
+    @Tool("Get detailed information for a specific product. Use this when user asks for details before making a decision.")
+    public String getProductDetail(@P("Product UUID, for example 550e8400-e29b-41d4-a716-446655440000") String productId) {
+        String normalizedId = safe(productId).trim();
+        if (normalizedId.isBlank()) {
+            advisorToolContext.recordTrace("getProductDetail: empty product id");
+            return "请提供商品ID，我才能读取完整详情。";
+        }
+
+        try {
+            UUID id = UUID.fromString(normalizedId);
+            Product product = productRepository.findById(id).block();
+            if (product == null) {
+                advisorToolContext.recordTrace("getProductDetail: not found " + normalizedId);
+                return "未找到该商品，请确认商品ID后重试。";
+            }
+
+            advisorToolContext.recordProducts("getProductDetail", List.of(product));
+            advisorToolContext.recordTrace("getProductDetail: found " + normalizedId);
+
+            return "商品详情："
+                    + "名称=" + blankToDefault(product.getName(), "未知")
+                    + "；价格=" + formatPrice(product.getPrice()) + " 元"
+                    + "；品类=" + blankToDefault(product.getCategory(), "未分类")
+                    + "；标签=" + blankToDefault(product.getTags(), "无")
+                    + "；卖点=" + blankToDefault(product.getSellingPoints(), "无")
+                    + "；保障=" + blankToDefault(product.getPolicy(), "无")
+                    + "；描述=" + blankToDefault(product.getDescription(), "无");
+        } catch (Exception error) {
+            advisorToolContext.recordTrace("getProductDetail: invalid id " + normalizedId);
+            return "商品ID格式不正确，请提供标准UUID。";
+        }
+    }
+
+    @Tool("Add a product to current user's cart with quantity. Use this only when user explicitly confirms purchase intent.")
+    public String addProductToCart(@P("Product UUID") String productId,
+                                   @P("Quantity, defaults to 1 when omitted or invalid") Integer quantity) {
+        UUID userId = advisorToolContext.currentUserId();
+        if (userId == null) {
+            advisorToolContext.recordTrace("addProductToCart: missing user context");
+            return "当前会话缺少用户信息，无法加入购物车。";
+        }
+
+        String normalizedId = safe(productId).trim();
+        if (normalizedId.isBlank()) {
+            advisorToolContext.recordTrace("addProductToCart: empty product id");
+            return "请先提供商品ID。";
+        }
+
+        int safeQuantity = quantity == null || quantity <= 0 ? 1 : Math.min(quantity, 99);
+
+        try {
+            UUID targetProductId = UUID.fromString(normalizedId);
+            Product product = productRepository.findById(targetProductId).block();
+            if (product == null) {
+                advisorToolContext.recordTrace("addProductToCart: product not found " + normalizedId);
+                return "商品不存在，无法加入购物车。";
+            }
+
+            CartItem existing = cartItemRepository.findByUserIdAndProductId(userId, targetProductId).block();
+            if (existing != null) {
+                existing.setQuantity(existing.getQuantity() + safeQuantity);
+                cartItemRepository.save(existing).block();
+            } else {
+                CartItem item = new CartItem(UUID.randomUUID(), userId, targetProductId, safeQuantity, Instant.now());
+                cartItemRepository.save(item).block();
+            }
+
+            advisorToolContext.recordTrace("addProductToCart: success " + normalizedId + " x" + safeQuantity);
+            advisorToolContext.recordProducts("addProductToCart", List.of(product));
+            return "已将商品加入购物车：" + blankToDefault(product.getName(), "未知商品") + " × " + safeQuantity;
+        } catch (Exception error) {
+            advisorToolContext.recordTrace("addProductToCart: failed " + error.getClass().getSimpleName());
+            return "加入购物车失败，请稍后重试。";
+        }
     }
 
     @Tool("Get the user's recent shopping conversation context and preference hints.")

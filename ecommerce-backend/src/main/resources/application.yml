@@ -20,6 +20,10 @@ app:
 
 ai:
   provider: ${AI_PROVIDER:deepseek}
+  advisor:
+    knowledge-base-enabled: ${AI_ADVISOR_KNOWLEDGE_BASE_ENABLED:true}
+    api-only-mode: ${AI_ADVISOR_API_ONLY_MODE:false}
+    stream-with-tools: ${AI_ADVISOR_STREAM_WITH_TOOLS:true}
   runtime-config:
     path: ${AI_RUNTIME_CONFIG_PATH:../.runtime/ecommerce-backend/ai-provider-config.json}
   catalog:

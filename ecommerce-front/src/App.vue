@@ -121,6 +121,24 @@ const floatingGuideInputRef = ref<HTMLInputElement | null>(null)
 const isFloatingGuideOpen = ref(false)
 const floatingGuidePrompt = ref('')
 let headerRaf = 0
+let presenceHeartbeatTimer: number | null = null
+
+const stopPresenceHeartbeat = () => {
+  if (presenceHeartbeatTimer !== null) {
+    window.clearInterval(presenceHeartbeatTimer)
+    presenceHeartbeatTimer = null
+  }
+}
+
+const startPresenceHeartbeat = () => {
+  stopPresenceHeartbeat()
+  presenceHeartbeatTimer = window.setInterval(() => {
+    if (!currentUser.value?.email) {
+      return
+    }
+    void syncCurrentUserPresence(true)
+  }, 30000)
+}
 
 const showFloatingGuide = computed(() => route.path !== '/chat')
 
@@ -260,9 +278,11 @@ watch(
   () => currentUser.value?.email,
   async (email) => {
     if (!email) {
+      stopPresenceHeartbeat()
       return
     }
     await syncCurrentUserPresence(true)
+    startPresenceHeartbeat()
   },
   { immediate: true }
 )
@@ -273,9 +293,13 @@ onMounted(() => {
   window.addEventListener('scroll', scheduleHeaderState, { passive: true })
   document.addEventListener('click', handleDocumentClick)
   void syncCurrentUserPresence(true)
+  if (currentUser.value?.email) {
+    startPresenceHeartbeat()
+  }
 })
 
 onBeforeUnmount(() => {
+  stopPresenceHeartbeat()
   window.removeEventListener('scroll', scheduleHeaderState)
   document.removeEventListener('click', handleDocumentClick)
   if (headerRaf) {

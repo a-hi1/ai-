@@ -758,7 +758,8 @@ const dashboardView = computed(() => ({
   dashboardServices: dashboardServices.value,
   categoryOptions: [
     { value: 'ALL', label: '当前监控节点', count: normalizedServices.value.length },
-    { value: 'backend', label: '电商后端', count: normalizedServices.value.filter(service => service.serverType === 'backend').length }
+    { value: 'backend', label: '电商后端', count: normalizedServices.value.filter(service => service.serverType === 'backend').length },
+    { value: 'account', label: '账号节点', count: normalizedServices.value.filter(service => service.serverType === 'account').length }
   ],
   typeFilter: typeFilter.value,
   averageCpuUsage: averageCpuUsage.value,
@@ -927,8 +928,10 @@ function sanitizeServices(items: ServiceSummary[]) {
 function inferServerType(service: ServiceSummary) {
   const rawType = String(service.serverType || '').trim().toLowerCase()
   const signature = `${service.serviceName || ''} ${service.serverId || ''}`.toLowerCase()
+  if (rawType.includes('account') || signature.includes('账号节点') || signature.includes('manual-account-')) return 'account'
   if (signature.includes('ecommerce-backend') || signature.includes('ecommerce') || signature.includes('backend')) return 'backend'
   const normalizedSource = rawType || signature
+  if (normalizedSource.includes('account')) return 'account'
   if (normalizedSource.includes('product')) return 'product'
   if (normalizedSource.includes('order')) return 'order'
   if (normalizedSource.includes('cart')) return 'cart'
@@ -1882,6 +1885,7 @@ function meterWidth(value?: number) {
 
 function formatServerType(type?: string) {
   if (type === 'ecommerce' || type === 'backend' || type === 'monolith') return '电商后端'
+  if (type === 'account') return '账号节点'
   if (type === 'product') return '产品服务'
   if (type === 'order') return '订单服务'
   if (type === 'user') return '用户服务'

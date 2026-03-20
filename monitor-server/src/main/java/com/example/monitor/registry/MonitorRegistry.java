@@ -3,6 +3,8 @@ package com.example.monitor.registry;
 import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.net.URI;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -17,6 +19,11 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+
+import java.lang.management.ManagementFactory;
+import java.io.File;
+
+import com.sun.management.OperatingSystemMXBean;
 
 import com.example.monitor.protocol.MonitorProtocol;
 import com.example.monitor.protocol.MonitorProtocol.AlertAckResult;
@@ -514,6 +521,7 @@ public final class MonitorRegistry {
 
         services.compute(serverId, (key, existing) -> {
             ServiceState current = existing == null ? new ServiceState(serverId) : existing;
+            String previousStatus = MonitorProtocol.stringValue(current.status());
             int resolvedPort = portValue == null ? current.port() : portValue;
             if (resolvedPort < 0 || resolvedPort > 65535) {
                 resolvedPort = current.port();
@@ -526,16 +534,30 @@ public final class MonitorRegistry {
                 resolvedHost = "127.0.0.1";
             }
 
-            current.serverType("backend");
+            current.serverType("account");
             current.serviceName("账号节点 " + normalizedAccount);
             current.host(resolvedHost);
             current.port(resolvedPort);
             current.status(targetOnline ? "ONLINE" : "OFFLINE");
             current.registerTime(current.registerTime() == null ? now : current.registerTime());
             current.lastHeartbeat(now);
-            current.startupTime(current.startupTime() == null ? now : current.startupTime());
+            if (targetOnline && "OFFLINE".equalsIgnoreCase(previousStatus)) {
+                current.startupTime(now);
+            } else {
+                current.startupTime(current.startupTime() == null ? now : current.startupTime());
+            }
+
+            if (targetOnline) {
+                applyAccountNodeMetrics(current, resolvedHost, resolvedPort);
+                current.enrichDerivedMetrics();
+                MetricSample metricSample = current.pushMetric(now);
+                persistMetric(current.serverId(), metricSample);
+                evaluateThresholdAlerts(current, now);
+            }
+
             appendLog(current, now, targetOnline ? "ACCOUNT_ONLINE" : "ACCOUNT_OFFLINE",
                     "Account " + normalizedAccount + (targetOnline ? " online" : " offline") + " @ " + resolvedHost + ":" + resolvedPort);
+            trimHistory(current, now);
             return current;
         });
 
@@ -547,6 +569,79 @@ public final class MonitorRegistry {
                 serverId,
                 targetOnline,
                 updated == null ? 0 : updated.port());
+    }
+
+    private void applyAccountNodeMetrics(ServiceState state, String host, int port) {
+        state.cpuUsage(sampleSystemCpuPercent());
+        state.memoryUsage(sampleSystemMemoryPercent());
+        state.diskUsage(sampleDiskUsagePercent());
+        state.networkLatency(sampleConnectLatency(host, port));
+    }
+
+    private double sampleSystemCpuPercent() {
+        try {
+            OperatingSystemMXBean osBean = (OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
+            double load = osBean.getSystemCpuLoad();
+            if (load < 0.0d) {
+                return 0.0d;
+            }
+            return Math.round(Math.min(100.0d, load * 100.0d) * 100.0d) / 100.0d;
+        } catch (Exception ignored) {
+            return 0.0d;
+        }
+    }
+
+    private double sampleSystemMemoryPercent() {
+        try {
+            OperatingSystemMXBean osBean = (OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
+            long total = osBean.getTotalMemorySize();
+            long free = osBean.getFreeMemorySize();
+            if (total <= 0L) {
+                return 0.0d;
+            }
+            double usedPercent = ((double) (total - free) / (double) total) * 100.0d;
+            return Math.round(Math.min(100.0d, Math.max(0.0d, usedPercent)) * 100.0d) / 100.0d;
+        } catch (Exception ignored) {
+            return 0.0d;
+        }
+    }
+
+    private double sampleDiskUsagePercent() {
+        try {
+            File[] roots = File.listRoots();
+            if (roots == null || roots.length == 0) {
+                return 0.0d;
+            }
+            long total = 0L;
+            long free = 0L;
+            for (File root : roots) {
+                if (root == null) {
+                    continue;
+                }
+                total += Math.max(0L, root.getTotalSpace());
+                free += Math.max(0L, root.getUsableSpace());
+            }
+            if (total <= 0L) {
+                return 0.0d;
+            }
+            double usedPercent = ((double) (total - free) / (double) total) * 100.0d;
+            return Math.round(Math.min(100.0d, Math.max(0.0d, usedPercent)) * 100.0d) / 100.0d;
+        } catch (Exception ignored) {
+            return 0.0d;
+        }
+    }
+
+    private int sampleConnectLatency(String host, int port) {
+        String targetHost = MonitorProtocol.stringValue(host).isBlank() ? "127.0.0.1" : host;
+        int targetPort = port <= 0 || port > 65535 ? 80 : port;
+        long begin = System.nanoTime();
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress(targetHost, targetPort), 1200);
+            long elapsedMs = (System.nanoTime() - begin) / 1_000_000L;
+            return (int) Math.max(1L, Math.min(5000L, elapsedMs));
+        } catch (Exception ignored) {
+            return 200;
+        }
     }
 
     private String buildManualAccountServerId(String accountKey) {

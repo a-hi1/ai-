@@ -133,6 +133,9 @@
                 <span class="speaker">{{ msg.role === 'user' ? '你的需求' : 'AI 导购建议' }}</span>
                 <span class="timestamp">{{ formatTime(msg.timestamp) }}</span>
               </div>
+              <div v-if="msg.role === 'assistant' && assistantApiUsageBadge(msg)" class="assistant-mini-meta">
+                <span class="mini-insight">{{ assistantApiUsageBadge(msg) }}</span>
+              </div>
 
               <div v-if="msg.role === 'assistant' && answerMode === 'detailed'" class="text assistant-text">
                 <div v-for="(block, blockIndex) in formatAssistantBlocks(compactAssistantDetail(getAssistantDisplayContent(msg)))" :key="`${getMessageKey(msg, index)}-${blockIndex}`" :class="['text-block', block.tone]">
@@ -1062,7 +1065,7 @@ const buildGuidedPrompt = (userMessage: string) => {
 const pushAssistantQuestion = (question: string) => {
   const questionMessage: Message = {
     role: 'assistant',
-    content: question,
+    content: '',
     timestamp: new Date().toISOString(),
     detectedIntent: `${guidedProfile.value.category || '商品'}导购需求采集中`,
     budgetSummary: guidedProfile.value.budget ? `预算约 ${formatCurrency(guidedProfile.value.budget)}` : '预算待确认'
@@ -1071,6 +1074,22 @@ const pushAssistantQuestion = (question: string) => {
   queueAssistantTyping(questionMessage, question, true)
   messageList.value.push(questionMessage)
   persistCurrentSession()
+}
+
+const appendStreamContent = (previous: string, chunk: string) => {
+  const next = `${previous || ''}${chunk || ''}`
+  return next
+    .replace(/\r/g, '')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+}
+
+const tidyAssistantMessage = (text: string) => {
+  return (text || '')
+    .replace(/\r/g, '')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
 }
 
 const compactAssistantDetail = (content: string) => {
@@ -1149,6 +1168,20 @@ const formatReasonLines = (goods: Goods) => {
 
 const insightValue = (msg: Message, label: string) => {
   return msg.insights?.find(item => item.label === label)?.value?.trim() || ''
+}
+
+const assistantApiUsageBadge = (msg: Message) => {
+  const guideSource = insightValue(msg, '引导来源') || insightValue(msg, '知识库来源')
+  if (!guideSource) {
+    return ''
+  }
+  if (guideSource.includes('无知识库') || guideSource.includes('API模式') || guideSource.includes('已关闭')) {
+    return '本轮：API 导购（无知识库）'
+  }
+  if (guideSource.includes('知识库增强')) {
+    return '本轮：API 导购 + 知识库增强'
+  }
+  return `本轮：${guideSource}`
 }
 
 const parseDimensionList = (value: string) => {
@@ -1351,7 +1384,6 @@ const ensureAiOpeningMessage = () => {
   messageList.value.push(openingMessage)
   persistCurrentSession()
 }
-
 const resetGuidedFlow = () => {
   guidedActive.value = false
   guidedStep.value = 0
@@ -1408,7 +1440,6 @@ const startNewConversation = () => {
   resetGuidedFlow()
   activeSessionId.value = session.id
   messageList.value = []
-  ensureAiOpeningMessage()
   inputValue.value = ''
   noticeType.value = 'success'
   notice.value = '已新建对话，你可以开始新的需求。'
@@ -1815,53 +1846,44 @@ const sendMessage = async () => {
     ? `${requestMessageSeed}\n\n【用户已选择跳过】${explicitSkipLabels.join('、')}。这些维度请按主流偏好补全，并在结果中简要说明默认取值。`
     : requestMessageSeed
 
-  const draftAssistantMessage: Message = {
+  const streamedAssistantMessage: Message = {
     role: 'assistant',
     content: '',
     timestamp: new Date().toISOString()
   }
-  ensureMessageLocalId(draftAssistantMessage)
-  queueAssistantTyping(draftAssistantMessage, '', true)
-  let draftMounted = false
-
-  const mountDraftMessage = () => {
-    if (draftMounted) {
-      return
-    }
-    messageList.value.push(draftAssistantMessage)
-    draftMounted = true
-    scrollToBottom()
-  }
+  ensureMessageLocalId(streamedAssistantMessage)
+  queueAssistantTyping(streamedAssistantMessage, '', true)
+  messageList.value.push(streamedAssistantMessage)
+  scrollToBottom()
 
   try {
-    let receivedFirstDelta = false
-    let streamedFinalPayload = null as Awaited<ReturnType<typeof api.sendChatStream>>
-    
-    const modePrefix = adviceMode.value === 'quick'
-      ? '【回答偏好】请控制在 2-3 句核心建议，保持自然口语。\n'
-      : ''
-    const streamMessage = `${modePrefix}${requestMessage}`
+    let finalPayload: Awaited<ReturnType<typeof api.sendChatQuick>> | Awaited<ReturnType<typeof api.sendChatStream>> | null = null
 
-    const chatRes = await api.sendChatStream(advisorUserId.value, streamMessage, activeSessionId.value, {
-      onProgress: (progress) => {
-        syncAnalysisProgress(progress)
-      },
-      onDelta: (chunk) => {
-        if (!chunk) {
-          return
+    if (adviceMode.value === 'quick') {
+      syncAnalysisProgress({ index: 1, total: 2, step: '快速模式：跳过深度追问，正在生成结果' })
+      finalPayload = await api.sendChatQuick(advisorUserId.value, requestMessage, activeSessionId.value)
+      queueAssistantTyping(streamedAssistantMessage, finalPayload?.reply || '')
+      syncAnalysisProgress({ index: 2, total: 2, step: '快速模式：结果已生成' })
+    } else {
+      let streamedFinalPayload = null as Awaited<ReturnType<typeof api.sendChatStream>>
+      const chatRes = await api.sendChatStream(advisorUserId.value, requestMessage, activeSessionId.value, {
+        onProgress: (progress) => {
+          syncAnalysisProgress(progress)
+        },
+        onDelta: (chunk) => {
+          if (!chunk) {
+            return
+          }
+          queueAssistantTyping(streamedAssistantMessage, chunk)
+          scrollToBottom()
+        },
+        onFinal: (payload) => {
+          streamedFinalPayload = payload
         }
-        mountDraftMessage()
-        draftAssistantMessage.content += chunk
-        receivedFirstDelta = true
-        queueAssistantTyping(draftAssistantMessage, chunk)
-        scrollToBottom()
-      },
-      onFinal: (payload) => {
-        streamedFinalPayload = payload
-      }
-    })
+      })
+      finalPayload = streamedFinalPayload || chatRes
+    }
 
-    const finalPayload = streamedFinalPayload || chatRes
     if (!finalPayload) {
       throw new Error('stream_final_payload_missing')
     }
@@ -1869,19 +1891,21 @@ const sendMessage = async () => {
     backendReachable.value = true
     const goodsList = (finalPayload.recommendations ?? []).map(mapRecommendation)
     const relatedGoods = (finalPayload.relatedRecommendations ?? []).map(mapRecommendation)
-    const normalizedReply = finalPayload.reply || draftAssistantMessage.content || '已为你整理好推荐结果，请查看下方商品卡片。'
-    mountDraftMessage()
-    draftAssistantMessage.content = normalizedReply
-    if (!receivedFirstDelta) {
-      queueAssistantTyping(draftAssistantMessage, normalizedReply, true)
+    const finalReply = tidyAssistantMessage(finalPayload.reply || streamedAssistantMessage.content)
+    streamedAssistantMessage.content = finalReply || '已为你整理好推荐结果，请查看下方商品卡片。'
+
+    const localId = ensureMessageLocalId(streamedAssistantMessage)
+    if (!(assistantRenderedContent.value[localId] || '').trim() && streamedAssistantMessage.content.trim()) {
+      queueAssistantTyping(streamedAssistantMessage, streamedAssistantMessage.content, true)
     }
-    draftAssistantMessage.goodsList = goodsList
-    draftAssistantMessage.relatedGoods = relatedGoods
-    draftAssistantMessage.insights = finalPayload.insights ?? []
-    draftAssistantMessage.timestamp = finalPayload.timestamp
-    draftAssistantMessage.budgetSummary = finalPayload.budgetSummary
-    draftAssistantMessage.detectedIntent = finalPayload.detectedIntent
-    draftAssistantMessage.fallback = finalPayload.fallback
+
+    streamedAssistantMessage.goodsList = goodsList
+    streamedAssistantMessage.relatedGoods = relatedGoods
+    streamedAssistantMessage.insights = finalPayload.insights ?? []
+    streamedAssistantMessage.timestamp = finalPayload.timestamp
+    streamedAssistantMessage.budgetSummary = finalPayload.budgetSummary
+    streamedAssistantMessage.detectedIntent = finalPayload.detectedIntent
+    streamedAssistantMessage.fallback = finalPayload.fallback
     persistCurrentSession()
 
     await Promise.all(goodsList.slice(0, 3).map(item => recordView(item, 'chat-recommendation')))
@@ -1894,12 +1918,6 @@ const sendMessage = async () => {
     }
 
     backendReachable.value = false
-    if (draftMounted) {
-      const draftIndex = messageList.value.lastIndexOf(draftAssistantMessage)
-      if (draftIndex >= 0 && !draftAssistantMessage.content.trim()) {
-        messageList.value.splice(draftIndex, 1)
-      }
-    }
     noticeType.value = 'error'
     notice.value = '当前 AI 请求超时或失败，已切换到本地推荐模式。'
     const fallbackPack = selectFallbackPack(inputVal, featuredGoods.value)
@@ -1950,7 +1968,6 @@ const initializeChat = async () => {
   useDemoAdvisor.value = false
 
   await Promise.allSettled([loadFeaturedProducts(), loadHistory()])
-  ensureAiOpeningMessage()
   await loadAiProviderOverview()
   focusLatestConversation()
   await maybeAutoSendPrompt()
@@ -2735,6 +2752,10 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
   gap: 12px;
   align-items: center;
   width: min(100%, 72ch);
+}
+
+.assistant-mini-meta {
+  margin-top: -2px;
 }
 
 .speaker,

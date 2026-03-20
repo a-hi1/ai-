@@ -7,6 +7,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 @ConfigurationProperties(prefix = "ai")
 public class AiProperties {
     private String provider = "deepseek";
+    private Advisor advisor = new Advisor();
     private Provider deepseek = new Provider();
     private Provider chatgpt = new Provider();
     private Provider siliconflow = new Provider();
@@ -17,6 +18,14 @@ public class AiProperties {
 
     public void setProvider(String provider) {
         this.provider = provider;
+    }
+
+    public Advisor getAdvisor() {
+        return advisor;
+    }
+
+    public void setAdvisor(Advisor advisor) {
+        this.advisor = advisor;
     }
 
     public Provider getDeepseek() {
@@ -41,6 +50,36 @@ public class AiProperties {
 
     public void setSiliconflow(Provider siliconflow) {
         this.siliconflow = siliconflow;
+    }
+
+    public static class Advisor {
+        private boolean knowledgeBaseEnabled = true;
+        private boolean apiOnlyMode = false;
+        private boolean streamWithTools = true;
+
+        public boolean isKnowledgeBaseEnabled() {
+            return knowledgeBaseEnabled;
+        }
+
+        public void setKnowledgeBaseEnabled(boolean knowledgeBaseEnabled) {
+            this.knowledgeBaseEnabled = knowledgeBaseEnabled;
+        }
+
+        public boolean isApiOnlyMode() {
+            return apiOnlyMode;
+        }
+
+        public void setApiOnlyMode(boolean apiOnlyMode) {
+            this.apiOnlyMode = apiOnlyMode;
+        }
+
+        public boolean isStreamWithTools() {
+            return streamWithTools;
+        }
+
+        public void setStreamWithTools(boolean streamWithTools) {
+            this.streamWithTools = streamWithTools;
+        }
     }
 
     public static class Provider {
