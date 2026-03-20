@@ -121,24 +121,13 @@
         </div>
 
         <div class="chat-container" ref="chatRef">
-          <div class="message-item system">
-            <div class="avatar">😊</div>
-            <div class="content">
-              <div class="meta-row">
-                <span class="speaker">AI 导购助手</span>
-                <span class="timestamp">{{ formatTime(systemTimestamp) }}</span>
-              </div>
-              <div class="text assistant-text system-text">
-                <div v-for="(block, blockIndex) in formatAssistantBlocks('请先告诉我想购买的品类。我会按该品类的专业维度逐步确认需求，再给出主推、备选和购买建议。你可以直接回答，也可以输入“跳过预算”“跳过品牌”等，我会用知识库默认值补全并继续推荐。')" :key="`system-${blockIndex}`" :class="['text-block', block.tone]">
-                  <span class="text-emoji">{{ block.emoji }}</span>
-                  <span class="text-line" v-html="block.html"></span>
-                </div>
-              </div>
+          <div v-for="(msg, index) in visibleMessageList" :key="getMessageKey(msg, index)" :class="['message-item', msg.role]">
+            <div class="avatar" :class="{ 'assistant-avatar': msg.role === 'assistant' }">
+              <template v-if="msg.role === 'assistant'">
+                <img :src="GUIDE_AVATAR_SRC" alt="AI 导购头像" class="avatar-img" loading="lazy" decoding="async" />
+              </template>
+              <template v-else>👤</template>
             </div>
-          </div>
-
-          <div v-for="(msg, index) in visibleMessageList" :key="`${msg.role}-${index}-${msg.timestamp}`" :class="['message-item', msg.role]">
-            <div class="avatar">{{ msg.role === 'user' ? '👤' : '😊' }}</div>
             <div class="content">
               <div class="meta-row">
                 <span class="speaker">{{ msg.role === 'user' ? '你的需求' : 'AI 导购建议' }}</span>
@@ -146,7 +135,7 @@
               </div>
 
               <div v-if="msg.role === 'assistant' && answerMode === 'detailed'" class="text assistant-text">
-                <div v-for="(block, blockIndex) in formatAssistantBlocks(compactAssistantDetail(msg.content))" :key="`${msg.timestamp}-${blockIndex}`" :class="['text-block', block.tone]">
+                <div v-for="(block, blockIndex) in formatAssistantBlocks(compactAssistantDetail(getAssistantDisplayContent(msg)))" :key="`${getMessageKey(msg, index)}-${blockIndex}`" :class="['text-block', block.tone]">
                   <span class="text-emoji">{{ block.emoji }}</span>
                   <span class="text-line" v-html="block.html"></span>
                 </div>
@@ -391,6 +380,10 @@ const DEMO_GUIDE_USER = {
 
 type Goods = ChatSessionGoods
 type Message = ChatSessionMessage
+type MessageWithLocalId = Message & { localId?: string }
+
+const GUIDE_AVATAR_SRC = '/guide-avatar.webp'
+const TYPEWRITER_INTERVAL_MS = 22
 
 interface SpeechRecognitionResultLike {
   0: { transcript: string }
@@ -448,7 +441,6 @@ const noticeType = ref<'success' | 'error'>('success')
 const backendReachable = ref(true)
 const featuredGoods = ref<Goods[]>([])
 const listening = ref(false)
-const systemTimestamp = new Date().toISOString()
 const sessionList = ref<ChatSessionRecord[]>([])
 const activeSessionId = ref('')
 const pendingAutoSend = ref(false)
@@ -585,6 +577,11 @@ const MAX_VISIBLE_MESSAGES = 40
 let analysisTimer: number | null = null
 let analysisStartedAt = 0
 let scrollFrameId: number | null = null
+let messageLocalIdSequence = 0
+
+const assistantRenderedContent = ref<Record<string, string>>({})
+const assistantTypingQueue = ref<Record<string, string>>({})
+const assistantTypingTimer = ref<Record<string, number>>({})
 
 let recognition: SpeechRecognitionLike | null = null
 
@@ -672,6 +669,89 @@ const providerStateClass = computed(() => {
   return providerConfig.value?.fallback ? 'fallback' : 'ready'
 })
 const providerRuntimeReason = computed(() => providerConfig.value?.runtimeReason || '未读取')
+
+const asLocalMessage = (message: Message) => message as MessageWithLocalId
+
+const nextMessageLocalId = () => `msg-${Date.now()}-${messageLocalIdSequence++}`
+
+const ensureMessageLocalId = (message: Message) => {
+  const localMessage = asLocalMessage(message)
+  if (!localMessage.localId) {
+    localMessage.localId = nextMessageLocalId()
+  }
+  return localMessage.localId
+}
+
+const hydrateSessionMessages = (messages: Message[]) => {
+  messages.forEach((message) => {
+    const localId = ensureMessageLocalId(message)
+    if (message.role === 'assistant') {
+      assistantRenderedContent.value[localId] = message.content || ''
+      assistantTypingQueue.value[localId] = ''
+    }
+  })
+}
+
+const getMessageKey = (message: Message, index: number) => {
+  const localId = ensureMessageLocalId(message)
+  return `${message.role}-${localId}-${index}`
+}
+
+const runAssistantTypewriter = (localId: string) => {
+  if (assistantTypingTimer.value[localId]) {
+    return
+  }
+
+  const tick = () => {
+    const queue = assistantTypingQueue.value[localId] || ''
+    if (!queue.length) {
+      const timerId = assistantTypingTimer.value[localId]
+      if (timerId) {
+        window.clearTimeout(timerId)
+      }
+      delete assistantTypingTimer.value[localId]
+      return
+    }
+
+    const nextChar = queue[0]
+    assistantTypingQueue.value[localId] = queue.slice(1)
+    assistantRenderedContent.value[localId] = `${assistantRenderedContent.value[localId] || ''}${nextChar}`
+    scrollToBottom()
+    assistantTypingTimer.value[localId] = window.setTimeout(tick, TYPEWRITER_INTERVAL_MS)
+  }
+
+  assistantTypingTimer.value[localId] = window.setTimeout(tick, TYPEWRITER_INTERVAL_MS)
+}
+
+const queueAssistantTyping = (message: Message, text: string, reset = false) => {
+  const localId = ensureMessageLocalId(message)
+  if (reset) {
+    assistantRenderedContent.value[localId] = ''
+    assistantTypingQueue.value[localId] = ''
+  }
+
+  if (!text) {
+    return
+  }
+
+  assistantTypingQueue.value[localId] = `${assistantTypingQueue.value[localId] || ''}${text}`
+  runAssistantTypewriter(localId)
+}
+
+const getAssistantDisplayContent = (message: Message) => {
+  if (message.role !== 'assistant') {
+    return message.content || ''
+  }
+
+  const localId = ensureMessageLocalId(message)
+  const rendered = assistantRenderedContent.value[localId]
+  if (rendered === undefined) {
+    assistantRenderedContent.value[localId] = message.content || ''
+    return message.content || ''
+  }
+
+  return rendered
+}
 
 const isExpiredAuthError = (error: unknown) => {
   return error instanceof Error && /当前登录信息已失效|Request failed:\s*404\b/.test(error.message)
@@ -980,18 +1060,21 @@ const buildGuidedPrompt = (userMessage: string) => {
 }
 
 const pushAssistantQuestion = (question: string) => {
-  messageList.value.push({
+  const questionMessage: Message = {
     role: 'assistant',
     content: question,
     timestamp: new Date().toISOString(),
     detectedIntent: `${guidedProfile.value.category || '商品'}导购需求采集中`,
     budgetSummary: guidedProfile.value.budget ? `预算约 ${formatCurrency(guidedProfile.value.budget)}` : '预算待确认'
-  })
+  }
+  ensureMessageLocalId(questionMessage)
+  queueAssistantTyping(questionMessage, question, true)
+  messageList.value.push(questionMessage)
   persistCurrentSession()
 }
 
 const compactAssistantDetail = (content: string) => {
-  const text = (content || '').replace(/\s+/g, ' ').trim()
+  const text = (content || '').replace(/\r/g, '\n').replace(/[\t ]+/g, ' ').trim()
   if (!text) {
     return '已为你整理好推荐结果，请直接查看下方商品卡片。'
   }
@@ -1006,7 +1089,7 @@ const compactAssistantDetail = (content: string) => {
     .filter(Boolean)
     .slice(0, 4)
 
-  return conciseSentences.length ? conciseSentences.join(' ') : text
+  return conciseSentences.length ? conciseSentences.join('\n') : text
 }
 
 const briefAssistantSentence = (msg: Message) => {
@@ -1237,7 +1320,12 @@ const persistCurrentSession = () => {
     return
   }
 
-  updateChatSessionMessages(advisorUserId.value, activeSessionId.value, messageList.value)
+  const sessionMessages = messageList.value.map((message) => {
+    const { localId: _localId, ...payload } = asLocalMessage(message)
+    return payload
+  })
+
+  updateChatSessionMessages(advisorUserId.value, activeSessionId.value, sessionMessages)
   refreshSessionList()
 }
 
@@ -1251,13 +1339,16 @@ const ensureAiOpeningMessage = () => {
     return
   }
 
-  messageList.value.push({
+  const openingMessage: Message = {
     role: 'assistant',
     content: '你好，我是你的 AI 导购顾问。为保证推荐结果专业且可执行，我会按品类确认关键维度（预算、场景、功能、品牌与细节限制）。你可以逐项回答，也可以随时输入“跳过预算/跳过品牌/跳过细节”，我会按知识库主流偏好补齐并继续推荐。先告诉我你想买什么品类。',
     timestamp: new Date().toISOString(),
     detectedIntent: '需求采集中',
     budgetSummary: '预算待确认'
-  })
+  }
+  ensureMessageLocalId(openingMessage)
+  queueAssistantTyping(openingMessage, openingMessage.content, true)
+  messageList.value.push(openingMessage)
   persistCurrentSession()
 }
 
@@ -1283,7 +1374,8 @@ const loadSession = (sessionId: string) => {
   }
 
   activeSessionId.value = session.id
-  messageList.value = session.messages
+  messageList.value = session.messages.map(message => ({ ...message }))
+  hydrateSessionMessages(messageList.value)
   void router.replace({ path: '/chat', query: { session: session.id } })
   focusLatestConversation()
 }
@@ -1728,8 +1820,18 @@ const sendMessage = async () => {
     content: '',
     timestamp: new Date().toISOString()
   }
-  messageList.value.push(draftAssistantMessage)
-  scrollToBottom()
+  ensureMessageLocalId(draftAssistantMessage)
+  queueAssistantTyping(draftAssistantMessage, '', true)
+  let draftMounted = false
+
+  const mountDraftMessage = () => {
+    if (draftMounted) {
+      return
+    }
+    messageList.value.push(draftAssistantMessage)
+    draftMounted = true
+    scrollToBottom()
+  }
 
   try {
     let receivedFirstDelta = false
@@ -1745,12 +1847,13 @@ const sendMessage = async () => {
         syncAnalysisProgress(progress)
       },
       onDelta: (chunk) => {
-        if (!receivedFirstDelta) {
-          draftAssistantMessage.content = chunk
-          receivedFirstDelta = true
-        } else {
-          draftAssistantMessage.content += chunk
+        if (!chunk) {
+          return
         }
+        mountDraftMessage()
+        draftAssistantMessage.content += chunk
+        receivedFirstDelta = true
+        queueAssistantTyping(draftAssistantMessage, chunk)
         scrollToBottom()
       },
       onFinal: (payload) => {
@@ -1766,7 +1869,12 @@ const sendMessage = async () => {
     backendReachable.value = true
     const goodsList = (finalPayload.recommendations ?? []).map(mapRecommendation)
     const relatedGoods = (finalPayload.relatedRecommendations ?? []).map(mapRecommendation)
-    draftAssistantMessage.content = finalPayload.reply || draftAssistantMessage.content || '已为你整理好推荐结果，请查看下方商品卡片。'
+    const normalizedReply = finalPayload.reply || draftAssistantMessage.content || '已为你整理好推荐结果，请查看下方商品卡片。'
+    mountDraftMessage()
+    draftAssistantMessage.content = normalizedReply
+    if (!receivedFirstDelta) {
+      queueAssistantTyping(draftAssistantMessage, normalizedReply, true)
+    }
     draftAssistantMessage.goodsList = goodsList
     draftAssistantMessage.relatedGoods = relatedGoods
     draftAssistantMessage.insights = finalPayload.insights ?? []
@@ -1786,9 +1894,11 @@ const sendMessage = async () => {
     }
 
     backendReachable.value = false
-    const draftIndex = messageList.value.lastIndexOf(draftAssistantMessage)
-    if (draftIndex >= 0 && !draftAssistantMessage.content.trim()) {
-      messageList.value.splice(draftIndex, 1)
+    if (draftMounted) {
+      const draftIndex = messageList.value.lastIndexOf(draftAssistantMessage)
+      if (draftIndex >= 0 && !draftAssistantMessage.content.trim()) {
+        messageList.value.splice(draftIndex, 1)
+      }
     }
     noticeType.value = 'error'
     notice.value = '当前 AI 请求超时或失败，已切换到本地推荐模式。'
@@ -1801,7 +1911,7 @@ const sendMessage = async () => {
       ...goods,
       tags: sanitizeGoodsTags(goods.tags)
     }))
-    messageList.value.push({
+    const fallbackMessage: Message = {
       role: 'assistant',
       content: '需求速览：本次 AI 导购请求超时或失败，我已切到本地真实商品库继续给你推荐。你现在看到的是本轮最值得优先比较的商品。',
       goodsList: fallbackRecommendations,
@@ -1815,7 +1925,10 @@ const sendMessage = async () => {
       budgetSummary: fallbackPack.budgetSummary,
       detectedIntent: fallbackPack.detectedIntent,
       fallback: true
-    })
+    }
+    ensureMessageLocalId(fallbackMessage)
+    queueAssistantTyping(fallbackMessage, fallbackMessage.content, true)
+    messageList.value.push(fallbackMessage)
     persistCurrentSession()
     resetGuidedFlow()
   } finally {
@@ -1852,6 +1965,10 @@ onBeforeUnmount(() => {
     window.clearInterval(analysisTimer)
     analysisTimer = null
   }
+  Object.values(assistantTypingTimer.value).forEach((timerId) => {
+    window.clearTimeout(timerId)
+  })
+  assistantTypingTimer.value = {}
   if (scrollFrameId !== null) {
     window.cancelAnimationFrame(scrollFrameId)
     scrollFrameId = null
@@ -2584,6 +2701,19 @@ watch(() => [route.query.prompt, route.query.autoSend], () => {
   justify-content: center;
   font-weight: 800;
   flex-shrink: 0;
+}
+
+.avatar-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 50%;
+}
+
+.assistant-avatar {
+  overflow: hidden;
+  background: #f6f3ee;
+  color: transparent;
 }
 
 .message-item.user .avatar {
